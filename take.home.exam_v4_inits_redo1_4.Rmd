@@ -1,0 +1,1803 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Load packages and data
+```{r}
+library(rjags); library(ggplot2); library(lme4); library(reshape2)
+library(rstan); library(rstanarm); library(loo)
+options(mc.cores = parallel::detectCores())
+# men <- read.csv("/Volumes/Documents/NC\ State\ Classes/ST540/Take\ Home\ Exam/men_sampled_shoe.csv")
+men <- read.csv("/Users/tschappe/Documents/NC\ State\ Classes/ST540/Take\ Home\ Exam/men_sampled_shoe.csv")
+men$gender <- rep("m", nrow(men))
+# women <- read.csv("/Volumes/Documents/NC\ State\ Classes/ST540/Take\ Home\ Exam/women_sampled_shoe.csv")
+women <- read.csv("/Users/tschappe/Documents/NC\ State\ Classes/ST540/Take\ Home\ Exam/women_sampled_shoe.csv")
+women$gender <- rep("w", nrow(women))
+#Combine the dataframes
+shoes <- rbind(men, women)
+#Remove observations with N/A for shoe type
+shoes <- shoes[!(is.na(shoes$vaporfly)) ,]
+#Extract age information from runner names
+shoes$age <- sapply(shoes$name_age, FUN = function(x) as.integer(substr(as.character(x), regexpr('[0-9]+', x), regexpr('[0-9]+', x)+1)))
+#Center and scale age variable
+shoes$age <- scale(shoes$age, center = T, scale = T)
+#Make vaporfly:runner and vaporfly:marathon indicator variables
+shoes$vaporfly_runner <- as.factor(paste(shoes$vaporfly, shoes$match_name, sep="_"))
+shoes$vaporfly_marathon <- as.factor(paste(shoes$vaporfly, shoes$marathon, sep="_"))
+
+#Remove observations with missing age
+shoes2 <- shoes[!(is.na(shoes$age)), ]
+shoes2$marathon <- factor(shoes2$marathon)
+shoes2$match_name <- factor(shoes2$match_name)
+
+#Remove marathons without both types of shoe
+marathon.vaporfly.table <- as.matrix(table(shoes$marathon, shoes$vaporfly))
+shoes3 <- shoes[shoes2$marathon %in% rownames(marathon.vaporfly.table[marathon.vaporfly.table[,2] > 0 ,]), ]
+shoes3$marathon <- factor(shoes3$marathon)
+
+
+
+
+
+
+#Remove observations without runners who ran races with and without vaporfly
+unique.names <- unique(shoes3$match_name)
+# sapply(unique.names, FUN = function(x) shoes3[length(shoes3$match_name == x) > 1, ])
+# shoes4 <- shoes3[length(shoes3$name_age)]
+
+test.out <- list(NULL)
+for (i in 1:length(unique.names)) {
+  test.out[[i]] <- shoes3[shoes3$match_name == unique.names[i], ][length(unique(shoes3$vaporfly[shoes3$match_name == unique.names[i]])) > 1]
+}
+shoes4 <- as.data.frame(do.call('rbind', test.out))
+```
+
+Update: The mixed effects actually does work. Here's why: To test whether vaporfly varies across runner, we add the runner random effect first, and then we add the T:runner or the F:runner to find the estimate when that runner was/wasn't wearing the vaporfly shoe. To find the effect for that runner, we simply find the difference between the two, F - T and see whether that is significantly less than 0. We could average those differences across runner to find the overall effect of vaporfly across runners. 
+
+### Final plan: 
+Model 1: time ~ vaporfly*gender + age*gender + (1|marathon) + (1|vaporfly:marathon) + (1|match_name) + (1|vaporfly:match_name)
+Model 2: time ~ vaporfly*gender + age*gender + (1|marathon) + (1|vaporfly:marathon) + (1|match_name) + (1|vaporfly:match_name), weights
+Model 3: time ~ vaporfly*gender + age*gender + (1+age|marathon) + (1|marathon) + (1|vaporfly:marathon) + (1|match_name) + (1|vaporfly:match_name)
+Model 4: (6758.3) time ~ vaporfly*gender + age*gender + (1+age|marathon) + (1|marathon) + (1|vaporfly:marathon) + (1|match_name) + (1|vaporfly:match_name), weights
+Model 5: log(time) with the best fitting model above
+
+## Model 1
+
+Stan code
+```{r}
+ml.a.1.stancode <- '
+data {
+  int<lower=1> N;                               //Number of observations
+  int<lower=1> P;                               //Number of predictors in X
+  int<lower=1> M;                               //Number of marathons
+  int<lower=1> Mp;                              //Number of marathon predictors
+  int<lower=1> R;                               //Number of runners
+  int<lower=1> VR;                              //Number of levels for vaporfly:runner
+  int<lower=1> VM;                              //Number of levels for vaporfly:marathon
+  int<lower=1, upper=M> marathon[N];            //Index of marathons
+  int<lower=1, upper=R> runner[N];              //Index of runners
+  int<lower=1, upper=VR> vaporfly_runner[N];    //Index of vaporfly:runner
+  int<lower=1, upper=VM> vaporfly_marathon[N];  //Index of vaporfly:marathon
+  matrix[N,P] X;                                //Fixed effects model matrix
+  matrix[N,Mp] Z_m;                             //Marathon-level random effects model matrix
+  vector[N] y;                                  //Response variable
+}
+
+transformed data {
+  vector[N] logy;                               //Log-transformed response variable
+
+  logy = log(y);
+}
+
+parameters {
+  vector[P] beta;                               //Vector of fixed-effects coefficients
+  real<lower=0> sigma_r;                        //Runner-level variance
+  real<lower=0> sigma_vr;                       //Vaporfly:runner-level variance
+  real<lower=0> sigma_vm;                       //Vaporfly:marathon-level variance
+  vector<lower=0>[Mp] sigma_m;                  //Vector for marathon-level variances (intercept and slope for age)
+  cholesky_factor_corr[Mp] L_m;                 //Correlation vector (Cholesky decomposition) of marathon-level intercept and slope
+  real<lower=0> sigma_e;                     //Error variance -- separate for each marathon
+  vector[R] r_raw;                              //Vector of unscaled runner-level random intercepts
+  vector[VR] vr_raw;                            //Vector of unscaled vaporfly:runner-level random intercepts
+  vector[VM] vm_raw;                            //Vector of unscaled vaporfly:marathon-level random intercepts
+  vector[Mp] m_raw[M];                          //Array of vectors of unscaled marathon-level random intercepts and slopes
+}
+
+transformed parameters {
+  vector[R] r;                                  //Vector of scaled runner-level random intercepts
+  vector[VR] vr;                                //Vector of scaled vaporfly:runner-level random intercepts
+  vector[VM] vm;                                //Vector of scaled vaporfly:marathon-level random intercepts
+  vector[Mp] m[M];                              //Array of vectors of scaled marathon-level random intercepts and slopes
+  
+  {
+    matrix[Mp, Mp] Sigma_m;                     //Marathon-level intercept and slope covariance matrix
+    r = sigma_r * r_raw;                        //Create scaled runner-level random intercepts
+    vr = sigma_vr * vr_raw;                     //Create scaled vaporfly:runner-level random intercepts
+    vm = sigma_vm * vm_raw;                     //Create scaled vaporfly:marathon-level random intercepts
+     
+    Sigma_m = diag_pre_multiply(sigma_m, L_m);  //Create marathon=level intercept and slope covariance matrix using Cholesky decomposition
+    for (a in 1:M) {
+      m[a] = Sigma_m * m_raw[a];                //Create scaled marathon-level random intercepts and slopes
+    }
+  }
+}
+
+model {
+  r_raw ~ std_normal();                         //Standard normal prior on unscaled runner-level random intercepts. Has effect of r ~ Normal(0, r_sigma).
+  vr_raw ~ std_normal();                        //Standard normal prior on unscaled vaporfly:runner-level random intercepts. Has effect of vr ~ Normal(0, vr_sigma).
+  vm_raw ~ std_normal();                        //Standard normal prior on unscaled vaporfly:marathon-level random intercepts. Has effect of vm ~ Normal(0, vm_sigma).
+  for (b in 1:M) {
+    m_raw[b] ~ std_normal();                    //Standard normal prior on unscaled marathon-level random intercepts. Has effect of m ~ MultivariateNormal(c(0,0), Sigma_m).
+  }
+  L_m ~ lkj_corr_cholesky(1);                   //LKJ prior on Cholesky correlation vector. Imposes uniform prior on correlation between intercept and slope.
+  sigma_r ~ cauchy(0,2);                        //Cauchy prior on runner-level hypervariance parameter.
+  for (c in 1:Mp) {
+    sigma_m[c] ~ cauchy(0,2);                   //Independent Cauchy priors on marathon-level intercept and slope hypervariance parameters.
+  }
+  sigma_vr ~ cauchy(0,2);                       //Cauchy prior on vaporfly:runner-level hypervariance parameter.
+  sigma_vm ~ cauchy(0,2);                       //Cauchy prior on vaporfly:marathon-level hypervariance parameter.
+  sigma_e ~ cauchy(0,2);                        //Cauchy prior on error variance.
+  
+  //Likelihood                                  //Normal likelihood function with mixed effects linear predictor and homoscedastic error variance assumption.
+  for (i in 1:N) {
+     y[i] ~ normal(X[i,]*beta + Z_m[i,]*m[marathon[i]] + r[runner[i]] + vr[vaporfly_runner[i]] + vm[vaporfly_marathon[i]], sigma_e);
+  }
+}
+
+generated quantities {
+  vector[N] residuals;                          //Vector for residuals
+  vector[N] yhat;                               //Vector for estimated linear predictor
+  vector[N] yhat_ppd;                           //Vector for posterior predictive distribution
+  vector[N] log_lik;                            //Vector for log-likelihood values for WAIC calculation
+  
+  for (j in 1:N) {
+    //Samples for the linear predictor yhat
+    yhat[j] = (X[j,]*beta + Z_m[j,]*m[marathon[j]] + r[runner[j]] + vr[vaporfly_runner[j]] + vm[vaporfly_marathon[j]]);
+    //Samples for the posterior predictive distribution, which includes error uncertainty
+    yhat_ppd[j] = normal_rng((X[j,]*beta + Z_m[j,]*m[marathon[j]] + r[runner[j]] + vr[vaporfly_runner[j]] + vm[vaporfly_marathon[j]]), sigma_e);
+    //Samples of log-likelihood for WAIC calculation
+    log_lik[j] = normal_lpdf(y[j] | (X[j,]*beta + Z_m[j,]*m[marathon[j]] + r[runner[j]] + vr[vaporfly_runner[j]] + vm[vaporfly_marathon[j]]), sigma_e);
+  }
+  
+  residuals = y - yhat;                         //Define residuals as y - hat
+
+}
+
+'
+```
+
+Define the data for stan
+```{r}
+ml.a.1.X <- model.matrix(~ vaporfly*gender + gender*age, data=shoes2)
+ml.a.1.Z_m <- model.matrix(~ 1, data=shoes2)
+ml.a.1.standata <- list(
+  N = nrow(ml.a.1.X),
+  P = ncol(ml.a.1.X),
+  Mp = ncol(ml.a.1.Z_m),
+  M = length(unique(as.integer(factor(shoes2$marathon)))),
+  R = length(unique(as.integer(factor(shoes2$match_name)))),
+  VM = length(unique(as.integer(factor(shoes2$vaporfly_marathon)))),
+  VR = length(unique(as.integer(factor(shoes2$vaporfly_runner)))),
+  marathon = as.integer(factor(shoes2$marathon)),
+  runner = as.integer(factor(shoes2$match_name)),
+  vaporfly_marathon = as.integer(factor(shoes2$vaporfly_marathon)),
+  vaporfly_runner = as.integer(factor(shoes2$vaporfly_runner)),
+  X = ml.a.1.X,
+  Z_m = ml.a.1.Z_m,
+  y = shoes2$time_minutes
+)
+```
+
+Set initial values
+```{r}
+Mp = ncol(ml.a.1.Z_m)
+M = length(unique(as.integer(factor(shoes2$marathon))))
+R = length(unique(as.integer(factor(shoes2$match_name))))
+VM = length(unique(as.integer(factor(shoes2$vaporfly_marathon))))
+VR = length(unique(as.integer(factor(shoes2$vaporfly_runner))))
+marathon = as.integer(factor(shoes2$marathon))
+runner = as.integer(factor(shoes2$match_name))
+vaporfly_marathon = as.integer(factor(shoes2$vaporfly_marathon))
+vaporfly_runner = as.integer(factor(shoes2$vaporfly_runner))
+
+initf2.norm <- function(chain_id = 1) {
+  # cat("chain_id =", chain_id, "\n")
+  list(beta = array(rnorm(ncol(ml.a.1.X), sd=0.1), dim = c(ncol(ml.a.1.X))),
+       sigma_r = 1,
+       sigma_vr = 1,
+       sigma_vm = 1,
+       sigma_m = array(rlnorm(Mp, sdlog = 0.1), dim = Mp),
+       sigma_e = array(rlnorm(1, sdlog = 0.1), dim=1),
+       r_raw = array(rnorm(R, sd=0.1), dim=R),
+       vr_raw = array(rnorm(VR, sd=0.1), dim=VR),
+       vm_raw = array(rnorm(VM, sd=0.1), dim=VM),
+       m_raw = array(rnorm(M*2, sd=0.1), dim = c(M,ncol(ml.a.1.Z_m)))
+       )
+}
+
+# generate a list of lists to specify initial values
+n_chains <- 3
+init_ll.norm <- lapply(1:n_chains, function(id) initf2.norm(chain_id = id))
+```
+
+Run the model
+```{r}
+ml.a.1.stanfit <- stan(
+  model_code = ml.a.1.stancode,
+  data=ml.a.1.standata, 
+  control = list(max_treedepth = 15, adapt_delta=0.9),
+  init = init_ll.norm,
+  chains=3,
+  warmup=3000,
+  iter=11000,
+  cores=3
+)
+```
+
+WAIC
+```{r}
+ml.a.1.stanfit.loglik <- extract_log_lik(ml.a.1.stanfit)
+fbar <- colMeans(exp(ml.a.1.stanfit.loglik))
+Pw <- sum(apply(ml.a.1.stanfit.loglik, 2, var))
+WAIC <- -2*sum(log(fbar)) + 2*Pw
+WAIC #6850.8, 6913.2, 6909
+```
+
+## Model 2 -- different variances for marathon
+
+Stan code
+```{r}
+ml.a.2.stancode <- '
+data {
+  int<lower=1> N;                               //Number of observations
+  int<lower=1> P;                               //Number of predictors in X
+  int<lower=1> M;                               //Number of marathons
+  int<lower=1> Mp;                              //Number of marathon predictors
+  int<lower=1> R;                               //Number of runners
+  int<lower=1> VR;                              //Number of levels for vaporfly:runner
+  int<lower=1> VM;                              //Number of levels for vaporfly:marathon
+  int<lower=1, upper=M> marathon[N];            //Index of marathons
+  int<lower=1, upper=R> runner[N];              //Index of runners
+  int<lower=1, upper=VR> vaporfly_runner[N];    //Index of vaporfly:runner
+  int<lower=1, upper=VM> vaporfly_marathon[N];  //Index of vaporfly:marathon
+  matrix[N,P] X;                                //Fixed effects model matrix
+  matrix[N,Mp] Z_m;                             //Marathon-level random effects model matrix
+  vector[N] y;                                  //Response variable
+}
+
+transformed data {
+  vector[N] logy;                               //Log-transformed response variable
+
+  logy = log(y);
+}
+
+parameters {
+  vector[P] beta;                               //Vector of fixed-effects coefficients
+  real<lower=0> sigma_r;                        //Runner-level variance
+  real<lower=0> sigma_vr;                       //Vaporfly:runner-level variance
+  real<lower=0> sigma_vm;                       //Vaporfly:marathon-level variance
+  vector<lower=0>[Mp] sigma_m;                  //Vector for marathon-level variances (intercept and slope for age)
+  cholesky_factor_corr[Mp] L_m;                 //Correlation vector (Cholesky decomposition) of marathon-level intercept and slope
+  real<lower=0> sigma_e[M];                     //Error variance -- separate for each marathon
+  vector[R] r_raw;                              //Vector of unscaled runner-level random intercepts
+  vector[VR] vr_raw;                            //Vector of unscaled vaporfly:runner-level random intercepts
+  vector[VM] vm_raw;                            //Vector of unscaled vaporfly:marathon-level random intercepts
+  vector[Mp] m_raw[M];                          //Array of vectors of unscaled marathon-level random intercepts and slopes
+}
+
+transformed parameters {
+  vector[R] r;                                  //Vector of scaled runner-level random intercepts
+  vector[VR] vr;                                //Vector of scaled vaporfly:runner-level random intercepts
+  vector[VM] vm;                                //Vector of scaled vaporfly:marathon-level random intercepts
+  vector[Mp] m[M];                              //Array of vectors of scaled marathon-level random intercepts and slopes
+  
+  {
+    matrix[Mp, Mp] Sigma_m;                     //Marathon-level intercept and slope covariance matrix
+    r = sigma_r * r_raw;                        //Create scaled runner-level random intercepts
+    vr = sigma_vr * vr_raw;                     //Create scaled vaporfly:runner-level random intercepts
+    vm = sigma_vm * vm_raw;                     //Create scaled vaporfly:marathon-level random intercepts
+     
+    Sigma_m = diag_pre_multiply(sigma_m, L_m);  //Create marathon=level intercept and slope covariance matrix using Cholesky decomposition
+    for (a in 1:M) {
+      m[a] = Sigma_m * m_raw[a];                //Create scaled marathon-level random intercepts and slopes
+    }
+  }
+}
+
+model {
+  r_raw ~ std_normal();                         //Standard normal prior on unscaled runner-level random intercepts. Has effect of r ~ Normal(0, r_sigma).
+  vr_raw ~ std_normal();                        //Standard normal prior on unscaled vaporfly:runner-level random intercepts. Has effect of vr ~ Normal(0, vr_sigma).
+  vm_raw ~ std_normal();                        //Standard normal prior on unscaled vaporfly:marathon-level random intercepts. Has effect of vm ~ Normal(0, vm_sigma).
+  for (b in 1:M) {
+    m_raw[b] ~ std_normal();                    //Standard normal prior on unscaled marathon-level random intercepts. Has effect of m ~ MultivariateNormal(c(0,0), Sigma_m).
+    sigma_e[b] ~ cauchy(0,2);                   //Independent Cauchy priors on error variances for each marathon.
+  }
+  L_m ~ lkj_corr_cholesky(1);                   //LKJ prior on Cholesky correlation vector. Imposes uniform prior on correlation between intercept and slope.
+  sigma_r ~ cauchy(0,2);                        //Cauchy prior on runner-level hypervariance parameter.
+  for (c in 1:Mp) {
+    sigma_m[c] ~ cauchy(0,2);                   //Independent Cauchy priors on marathon-level intercept and slope hypervariance parameters.
+  }
+  sigma_vr ~ cauchy(0,2);                       //Cauchy prior on vaporfly:runner-level hypervariance parameter.
+  sigma_vm ~ cauchy(0,2);                       //Cauchy prior on vaporfly:marathon-level hypervariance parameter.
+  
+  //Likelihood                                  //Normal likelihood function with mixed effects linear predictor and homoscedastic error variance assumption.
+  for (i in 1:N) {
+     y[i] ~ normal(X[i,]*beta + Z_m[i,]*m[marathon[i]] + r[runner[i]] + vr[vaporfly_runner[i]] + vm[vaporfly_marathon[i]], sigma_e[marathon[i]]);
+  }
+}
+
+generated quantities {
+  vector[N] residuals;                          //Vector for residuals
+  vector[N] yhat;                               //Vector for estimated linear predictor
+  vector[N] yhat_ppd;                           //Vector for posterior predictive distribution
+  vector[N] log_lik;                            //Vector for log-likelihood values for WAIC calculation
+  
+  for (j in 1:N) {
+    //Samples for the linear predictor yhat
+    yhat[j] = (X[j,]*beta + Z_m[j,]*m[marathon[j]] + r[runner[j]] + vr[vaporfly_runner[j]] + vm[vaporfly_marathon[j]]);
+    //Samples for the posterior predictive distribution, which includes error uncertainty
+    yhat_ppd[j] = normal_rng((X[j,]*beta + Z_m[j,]*m[marathon[j]] + r[runner[j]] + vr[vaporfly_runner[j]] + vm[vaporfly_marathon[j]]), sigma_e[marathon[j]]);
+    //Samples of log-likelihood for WAIC calculation
+    log_lik[j] = normal_lpdf(y[j] | (X[j,]*beta + Z_m[j,]*m[marathon[j]] + r[runner[j]] + vr[vaporfly_runner[j]] + vm[vaporfly_marathon[j]]), sigma_e[marathon[j]]);
+  }
+  
+  residuals = y - yhat;                         //Define residuals as y - hat
+
+}
+
+'
+```
+
+Define the data for stan
+```{r}
+ml.a.2.X <- model.matrix(~ vaporfly*gender + gender*age, data=shoes2)
+ml.a.2.Z_m <- model.matrix(~ 1, data=shoes2)
+ml.a.2.standata <- list(
+  N = nrow(ml.a.2.X),
+  P = ncol(ml.a.2.X),
+  Mp = ncol(ml.a.2.Z_m),
+  M = length(unique(as.integer(factor(shoes2$marathon)))),
+  R = length(unique(as.integer(factor(shoes2$match_name)))),
+  VM = length(unique(as.integer(factor(shoes2$vaporfly_marathon)))),
+  VR = length(unique(as.integer(factor(shoes2$vaporfly_runner)))),
+  marathon = as.integer(factor(shoes2$marathon)),
+  runner = as.integer(factor(shoes2$match_name)),
+  vaporfly_marathon = as.integer(factor(shoes2$vaporfly_marathon)),
+  vaporfly_runner = as.integer(factor(shoes2$vaporfly_runner)),
+  X = ml.a.2.X,
+  Z_m = ml.a.2.Z_m,
+  y = shoes2$time_minutes
+)
+```
+
+Set initial values
+```{r}
+Mp = ncol(ml.a.2.Z_m)
+M = length(unique(as.integer(factor(shoes2$marathon))))
+R = length(unique(as.integer(factor(shoes2$match_name))))
+VM = length(unique(as.integer(factor(shoes2$vaporfly_marathon))))
+VR = length(unique(as.integer(factor(shoes2$vaporfly_runner))))
+marathon = as.integer(factor(shoes2$marathon))
+runner = as.integer(factor(shoes2$match_name))
+vaporfly_marathon = as.integer(factor(shoes2$vaporfly_marathon))
+vaporfly_runner = as.integer(factor(shoes2$vaporfly_runner))
+
+initf2.norm <- function(chain_id = 1) {
+  # cat("chain_id =", chain_id, "\n")
+  list(beta = array(rnorm(ncol(ml.a.2.X), sd=0.1), dim = c(ncol(ml.a.2.X))),
+       sigma_r = 1,
+       sigma_vr = 1,
+       sigma_vm = 1,
+       sigma_m = array(rlnorm(Mp, sdlog = 0.1), dim = Mp),
+       sigma_e = array(rlnorm(M, sdlog = 0.1), dim=M),
+       r_raw = array(rnorm(R, sd=0.1), dim=R),
+       vr_raw = array(rnorm(VR, sd=0.1), dim=VR),
+       vm_raw = array(rnorm(VM, sd=0.1), dim=VM),
+       m_raw = array(rnorm(M*2, sd=0.1), dim = c(M,ncol(ml.a.2.Z_m)))
+       )
+}
+
+# generate a list of lists to specify initial values
+n_chains <- 3
+init_ll.norm <- lapply(1:n_chains, function(id) initf2.norm(chain_id = id))
+```
+
+Run the model
+```{r}
+ml.a.2.stanfit <- stan(
+  model_code = ml.a.2.stancode,
+  data=ml.a.2.standata, 
+  control = list(max_treedepth = 15, adapt_delta=0.9),
+  init = init_ll.norm,
+  chains=3,
+  warmup=3000,
+  iter=11000,
+  cores=3
+)
+```
+
+WAIC
+```{r}
+ml.a.2.stanfit.loglik <- extract_log_lik(ml.a.2.stanfit)
+fbar <- colMeans(exp(ml.a.2.stanfit.loglik))
+Pw <- sum(apply(ml.a.2.stanfit.loglik, 2, var))
+WAIC <- -2*sum(log(fbar)) + 2*Pw
+WAIC #6756.3, 6814.6, 6791.4
+```
+
+
+## Model 3 -- Random age slope by marathon with homoscedastic error variance
+
+Stan code
+```{r}
+ml.a.3.stancode <- '
+data {
+  int<lower=1> N;                               //Number of observations
+  int<lower=1> P;                               //Number of predictors in X
+  int<lower=1> M;                               //Number of marathons
+  int<lower=1> Mp;                              //Number of marathon predictors
+  int<lower=1> R;                               //Number of runners
+  int<lower=1> VR;                              //Number of levels for vaporfly:runner
+  int<lower=1> VM;                              //Number of levels for vaporfly:marathon
+  int<lower=1, upper=M> marathon[N];            //Index of marathons
+  int<lower=1, upper=R> runner[N];              //Index of runners
+  int<lower=1, upper=VR> vaporfly_runner[N];    //Index of vaporfly:runner
+  int<lower=1, upper=VM> vaporfly_marathon[N];  //Index of vaporfly:marathon
+  matrix[N,P] X;                                //Fixed effects model matrix
+  matrix[N,Mp] Z_m;                             //Marathon-level random effects model matrix
+  vector[N] y;                                  //Response variable
+}
+
+transformed data {
+  vector[N] logy;                               //Log-transformed response variable
+
+  logy = log(y);
+}
+
+parameters {
+  vector[P] beta;                               //Vector of fixed-effects coefficients
+  real<lower=0> sigma_r;                        //Runner-level variance
+  real<lower=0> sigma_vr;                       //Vaporfly:runner-level variance
+  real<lower=0> sigma_vm;                       //Vaporfly:marathon-level variance
+  vector<lower=0>[Mp] sigma_m;                  //Vector for marathon-level variances (intercept and slope for age)
+  cholesky_factor_corr[Mp] L_m;                 //Correlation vector (Cholesky decomposition) of marathon-level intercept and slope
+  real<lower=0> sigma_e;                     //Error variance -- separate for each marathon
+  vector[R] r_raw;                              //Vector of unscaled runner-level random intercepts
+  vector[VR] vr_raw;                            //Vector of unscaled vaporfly:runner-level random intercepts
+  vector[VM] vm_raw;                            //Vector of unscaled vaporfly:marathon-level random intercepts
+  vector[Mp] m_raw[M];                          //Array of vectors of unscaled marathon-level random intercepts and slopes
+}
+
+transformed parameters {
+  vector[R] r;                                  //Vector of scaled runner-level random intercepts
+  vector[VR] vr;                                //Vector of scaled vaporfly:runner-level random intercepts
+  vector[VM] vm;                                //Vector of scaled vaporfly:marathon-level random intercepts
+  vector[Mp] m[M];                              //Array of vectors of scaled marathon-level random intercepts and slopes
+  
+  {
+    matrix[Mp, Mp] Sigma_m;                     //Marathon-level intercept and slope covariance matrix
+    r = sigma_r * r_raw;                        //Create scaled runner-level random intercepts
+    vr = sigma_vr * vr_raw;                     //Create scaled vaporfly:runner-level random intercepts
+    vm = sigma_vm * vm_raw;                     //Create scaled vaporfly:marathon-level random intercepts
+     
+    Sigma_m = diag_pre_multiply(sigma_m, L_m);  //Create marathon=level intercept and slope covariance matrix using Cholesky decomposition
+    for (a in 1:M) {
+      m[a] = Sigma_m * m_raw[a];                //Create scaled marathon-level random intercepts and slopes
+    }
+  }
+}
+
+model {
+  r_raw ~ std_normal();                         //Standard normal prior on unscaled runner-level random intercepts. Has effect of r ~ Normal(0, r_sigma).
+  vr_raw ~ std_normal();                        //Standard normal prior on unscaled vaporfly:runner-level random intercepts. Has effect of vr ~ Normal(0, vr_sigma).
+  vm_raw ~ std_normal();                        //Standard normal prior on unscaled vaporfly:marathon-level random intercepts. Has effect of vm ~ Normal(0, vm_sigma).
+  for (b in 1:M) {
+    m_raw[b] ~ std_normal();                    //Standard normal prior on unscaled marathon-level random intercepts. Has effect of m ~ MultivariateNormal(c(0,0), Sigma_m).
+  }
+  L_m ~ lkj_corr_cholesky(1);                   //LKJ prior on Cholesky correlation vector. Imposes uniform prior on correlation between intercept and slope.
+  sigma_r ~ cauchy(0,2);                        //Cauchy prior on runner-level hypervariance parameter.
+  for (c in 1:Mp) {
+    sigma_m[c] ~ cauchy(0,2);                   //Independent Cauchy priors on marathon-level intercept and slope hypervariance parameters.
+  }
+  sigma_vr ~ cauchy(0,2);                       //Cauchy prior on vaporfly:runner-level hypervariance parameter.
+  sigma_vm ~ cauchy(0,2);                       //Cauchy prior on vaporfly:marathon-level hypervariance parameter.
+  sigma_e ~ cauchy(0,2);                        //Cauchy prior on error variance.
+  
+  //Likelihood                                  //Normal likelihood function with mixed effects linear predictor and homoscedastic error variance assumption.
+  for (i in 1:N) {
+     y[i] ~ normal(X[i,]*beta + Z_m[i,]*m[marathon[i]] + r[runner[i]] + vr[vaporfly_runner[i]] + vm[vaporfly_marathon[i]], sigma_e);
+  }
+}
+
+generated quantities {
+  vector[N] residuals;                          //Vector for residuals
+  vector[N] yhat;                               //Vector for estimated linear predictor
+  vector[N] yhat_ppd;                           //Vector for posterior predictive distribution
+  vector[N] log_lik;                            //Vector for log-likelihood values for WAIC calculation
+  
+  for (j in 1:N) {
+    //Samples for the linear predictor yhat
+    yhat[j] = (X[j,]*beta + Z_m[j,]*m[marathon[j]] + r[runner[j]] + vr[vaporfly_runner[j]] + vm[vaporfly_marathon[j]]);
+    //Samples for the posterior predictive distribution, which includes error uncertainty
+    yhat_ppd[j] = normal_rng((X[j,]*beta + Z_m[j,]*m[marathon[j]] + r[runner[j]] + vr[vaporfly_runner[j]] + vm[vaporfly_marathon[j]]), sigma_e);
+    //Samples of log-likelihood for WAIC calculation
+    log_lik[j] = normal_lpdf(y[j] | (X[j,]*beta + Z_m[j,]*m[marathon[j]] + r[runner[j]] + vr[vaporfly_runner[j]] + vm[vaporfly_marathon[j]]), sigma_e);
+  }
+  
+  residuals = y - yhat;                         //Define residuals as y - hat
+
+}
+
+'
+```
+
+Define the data for stan
+```{r}
+ml.a.3.X <- model.matrix(~ vaporfly*gender + gender*age, data=shoes2)
+ml.a.3.Z_m <- model.matrix(~ 1 + age, data=shoes2)
+ml.a.3.standata <- list(
+  N = nrow(ml.a.3.X),
+  P = ncol(ml.a.3.X),
+  Mp = ncol(ml.a.3.Z_m),
+  M = length(unique(as.integer(factor(shoes2$marathon)))),
+  R = length(unique(as.integer(factor(shoes2$match_name)))),
+  VM = length(unique(as.integer(factor(shoes2$vaporfly_marathon)))),
+  VR = length(unique(as.integer(factor(shoes2$vaporfly_runner)))),
+  marathon = as.integer(factor(shoes2$marathon)),
+  runner = as.integer(factor(shoes2$match_name)),
+  vaporfly_marathon = as.integer(factor(shoes2$vaporfly_marathon)),
+  vaporfly_runner = as.integer(factor(shoes2$vaporfly_runner)),
+  X = ml.a.3.X,
+  Z_m = ml.a.3.Z_m,
+  y = shoes2$time_minutes
+)
+```
+
+Set initial values
+```{r}
+Mp = ncol(ml.a.3.Z_m)
+M = length(unique(as.integer(factor(shoes2$marathon))))
+R = length(unique(as.integer(factor(shoes2$match_name))))
+VM = length(unique(as.integer(factor(shoes2$vaporfly_marathon))))
+VR = length(unique(as.integer(factor(shoes2$vaporfly_runner))))
+marathon = as.integer(factor(shoes2$marathon))
+runner = as.integer(factor(shoes2$match_name))
+vaporfly_marathon = as.integer(factor(shoes2$vaporfly_marathon))
+vaporfly_runner = as.integer(factor(shoes2$vaporfly_runner))
+
+initf2.norm <- function(chain_id = 1) {
+  # cat("chain_id =", chain_id, "\n")
+  list(beta = array(rnorm(ncol(ml.a.3.X), sd=0.1), dim = c(ncol(ml.a.3.X))),
+       sigma_r = 1,
+       sigma_vr = 1,
+       sigma_vm = 1,
+       sigma_m = array(rlnorm(Mp, sdlog = 0.1), dim = Mp),
+       sigma_e = array(rlnorm(M, sdlog = 0.1), dim=M),
+       r_raw = array(rnorm(R, sd=0.1), dim=R),
+       vr_raw = array(rnorm(VR, sd=0.1), dim=VR),
+       vm_raw = array(rnorm(VM, sd=0.1), dim=VM),
+       m_raw = array(rnorm(M*2, sd=0.1), dim = c(M,2))
+       )
+}
+
+# generate a list of lists to specify initial values
+n_chains <- 3
+init_ll.norm <- lapply(1:n_chains, function(id) initf2.norm(chain_id = id))
+```
+
+
+Run the model
+```{r}
+ml.a.3.stanfit <- stan(
+  model_code = ml.a.3.stancode,
+  data=ml.a.3.standata, 
+  control = list(max_treedepth = 15, adapt_delta=0.9),
+  init = init_ll.norm,
+  chains=4,
+  warmup=1000,
+  iter=2000,
+  cores=4
+)
+```
+
+WAIC
+```{r}
+ml.a.3.stanfit.loglik <- extract_log_lik(ml.a.3.stanfit)
+fbar <- colMeans(exp(ml.a.3.stanfit.loglik))
+Pw <- sum(apply(ml.a.3.stanfit.loglik, 2, var))
+WAIC <- -2*sum(log(fbar)) + 2*Pw
+WAIC #6905, #6912.4
+```
+
+## Model 4 -- Random age slope by marathon with heteroscedastic error variance
+
+Stan code
+```{r}
+ml.a.4.stancode <- '
+data {
+  int<lower=1> N;                               //Number of observations
+  int<lower=1> P;                               //Number of predictors in X
+  int<lower=1> M;                               //Number of marathons
+  int<lower=1> Mp;                              //Number of marathon predictors
+  int<lower=1> R;                               //Number of runners
+  int<lower=1> VR;                              //Number of levels for vaporfly:runner
+  int<lower=1> VM;                              //Number of levels for vaporfly:marathon
+  int<lower=1, upper=M> marathon[N];            //Index of marathons
+  int<lower=1, upper=R> runner[N];              //Index of runners
+  int<lower=1, upper=VR> vaporfly_runner[N];    //Index of vaporfly:runner
+  int<lower=1, upper=VM> vaporfly_marathon[N];  //Index of vaporfly:marathon
+  matrix[N,P] X;                                //Fixed effects model matrix
+  matrix[N,Mp] Z_m;                             //Marathon-level random effects model matrix
+  vector[N] y;                                  //Response variable
+}
+
+transformed data {
+  vector[N] logy;                               //Log-transformed response variable
+
+  logy = log(y);
+}
+
+parameters {
+  vector[P] beta;                               //Vector of fixed-effects coefficients
+  real<lower=0> sigma_r;                        //Runner-level variance
+  real<lower=0> sigma_vr;                       //Vaporfly:runner-level variance
+  real<lower=0> sigma_vm;                       //Vaporfly:marathon-level variance
+  vector<lower=0>[Mp] sigma_m;                  //Vector for marathon-level variances (intercept and slope for age)
+  cholesky_factor_corr[Mp] L_m;                 //Correlation vector (Cholesky decomposition) of marathon-level intercept and slope
+  real<lower=0> sigma_e[M];                     //Error variance -- separate for each marathon
+  vector[R] r_raw;                              //Vector of unscaled runner-level random intercepts
+  vector[VR] vr_raw;                            //Vector of unscaled vaporfly:runner-level random intercepts
+  vector[VM] vm_raw;                            //Vector of unscaled vaporfly:marathon-level random intercepts
+  vector[Mp] m_raw[M];                          //Array of vectors of unscaled marathon-level random intercepts and slopes
+}
+
+transformed parameters {
+  vector[R] r;                                  //Vector of scaled runner-level random intercepts
+  vector[VR] vr;                                //Vector of scaled vaporfly:runner-level random intercepts
+  vector[VM] vm;                                //Vector of scaled vaporfly:marathon-level random intercepts
+  vector[Mp] m[M];                              //Array of vectors of scaled marathon-level random intercepts and slopes
+  
+  {
+    matrix[Mp, Mp] Sigma_m;                     //Marathon-level intercept and slope covariance matrix
+    r = sigma_r * r_raw;                        //Create scaled runner-level random intercepts
+    vr = sigma_vr * vr_raw;                     //Create scaled vaporfly:runner-level random intercepts
+    vm = sigma_vm * vm_raw;                     //Create scaled vaporfly:marathon-level random intercepts
+     
+    Sigma_m = diag_pre_multiply(sigma_m, L_m);  //Create marathon=level intercept and slope covariance matrix using Cholesky decomposition
+    for (a in 1:M) {
+      m[a] = Sigma_m * m_raw[a];                //Create scaled marathon-level random intercepts and slopes
+    }
+  }
+}
+
+model {
+  r_raw ~ std_normal();                         //Standard normal prior on unscaled runner-level random intercepts. Has effect of r ~ Normal(0, r_sigma).
+  vr_raw ~ std_normal();                        //Standard normal prior on unscaled vaporfly:runner-level random intercepts. Has effect of vr ~ Normal(0, vr_sigma).
+  vm_raw ~ std_normal();                        //Standard normal prior on unscaled vaporfly:marathon-level random intercepts. Has effect of vm ~ Normal(0, vm_sigma).
+  for (b in 1:M) {
+    m_raw[b] ~ std_normal();                    //Standard normal prior on unscaled marathon-level random intercepts. Has effect of m ~ MultivariateNormal(c(0,0), Sigma_m).
+    sigma_e[b] ~ cauchy(0,2);                   //Independent Cauchy priors on error variances for each marathon.
+  }
+  L_m ~ lkj_corr_cholesky(1);                   //LKJ prior on Cholesky correlation vector. Imposes uniform prior on correlation between intercept and slope.
+  sigma_r ~ cauchy(0,2);                        //Cauchy prior on runner-level hypervariance parameter.
+  for (c in 1:Mp) {
+    sigma_m[c] ~ cauchy(0,2);                   //Independent Cauchy priors on marathon-level intercept and slope hypervariance parameters.
+  }
+  sigma_vr ~ cauchy(0,2);                       //Cauchy prior on vaporfly:runner-level hypervariance parameter.
+  sigma_vm ~ cauchy(0,2);                       //Cauchy prior on vaporfly:marathon-level hypervariance parameter.
+  
+  //Likelihood                                  //Normal likelihood function with mixed effects linear predictor and homoscedastic error variance assumption.
+  for (i in 1:N) {
+     y[i] ~ normal(X[i,]*beta + Z_m[i,]*m[marathon[i]] + r[runner[i]] + vr[vaporfly_runner[i]] + vm[vaporfly_marathon[i]], sigma_e[marathon[i]]);
+  }
+}
+
+generated quantities {
+  vector[N] residuals;                          //Vector for residuals
+  vector[N] yhat;                               //Vector for estimated linear predictor
+  vector[N] yhat_ppd;                           //Vector for posterior predictive distribution
+  vector[N] log_lik;                            //Vector for log-likelihood values for WAIC calculation
+  
+  for (j in 1:N) {
+    //Samples for the linear predictor yhat
+    yhat[j] = (X[j,]*beta + Z_m[j,]*m[marathon[j]] + r[runner[j]] + vr[vaporfly_runner[j]] + vm[vaporfly_marathon[j]]);
+    //Samples for the posterior predictive distribution, which includes error uncertainty
+    yhat_ppd[j] = normal_rng((X[j,]*beta + Z_m[j,]*m[marathon[j]] + r[runner[j]] + vr[vaporfly_runner[j]] + vm[vaporfly_marathon[j]]), sigma_e[marathon[j]]);
+    //Samples of log-likelihood for WAIC calculation
+    log_lik[j] = normal_lpdf(y[j] | (X[j,]*beta + Z_m[j,]*m[marathon[j]] + r[runner[j]] + vr[vaporfly_runner[j]] + vm[vaporfly_marathon[j]]), sigma_e[marathon[j]]);
+  }
+  
+  residuals = y - yhat;                         //Define residuals as y - hat
+
+}
+
+'
+```
+Define the data for stan
+```{r}
+ml.a.4.X <- model.matrix(~ vaporfly*gender + gender*age, data=shoes2)
+ml.a.4.Z_m <- model.matrix(~ 1 + age, data=shoes2)
+ml.a.4.standata <- list(
+  N = nrow(ml.a.4.X),
+  P = ncol(ml.a.4.X),
+  Mp = ncol(ml.a.4.Z_m),
+  M = length(unique(as.integer(factor(shoes2$marathon)))),
+  R = length(unique(as.integer(factor(shoes2$match_name)))),
+  VM = length(unique(as.integer(factor(shoes2$vaporfly_marathon)))),
+  VR = length(unique(as.integer(factor(shoes2$vaporfly_runner)))),
+  marathon = as.integer(factor(shoes2$marathon)),
+  runner = as.integer(factor(shoes2$match_name)),
+  vaporfly_marathon = as.integer(factor(shoes2$vaporfly_marathon)),
+  vaporfly_runner = as.integer(factor(shoes2$vaporfly_runner)),
+  X = ml.a.4.X,
+  Z_m = ml.a.4.Z_m,
+  y = shoes2$time_minutes
+)
+```
+
+Set initial values
+```{r}
+Mp = ncol(ml.a.4.Z_m)
+M = length(unique(as.integer(factor(shoes2$marathon))))
+R = length(unique(as.integer(factor(shoes2$match_name))))
+VM = length(unique(as.integer(factor(shoes2$vaporfly_marathon))))
+VR = length(unique(as.integer(factor(shoes2$vaporfly_runner))))
+marathon = as.integer(factor(shoes2$marathon))
+runner = as.integer(factor(shoes2$match_name))
+vaporfly_marathon = as.integer(factor(shoes2$vaporfly_marathon))
+vaporfly_runner = as.integer(factor(shoes2$vaporfly_runner))
+
+initf2.norm <- function(chain_id = 1) {
+  # cat("chain_id =", chain_id, "\n")
+  list(beta = array(rnorm(ncol(ml.a.4.X), sd=0.1), dim = c(ncol(ml.a.4.X))),
+       sigma_r = 1,
+       sigma_vr = 1,
+       sigma_vm = 1,
+       sigma_m = array(rlnorm(Mp, sdlog = 0.1), dim = Mp),
+       sigma_e = array(rlnorm(M, sdlog = 0.1), dim=M),
+       r_raw = array(rnorm(R, sd=0.1), dim=R),
+       vr_raw = array(rnorm(VR, sd=0.1), dim=VR),
+       vm_raw = array(rnorm(VM, sd=0.1), dim=VM),
+       m_raw = array(rnorm(M*2, sd=0.1), dim = c(M,2))
+       )
+}
+
+# generate a list of lists to specify initial values
+n_chains <- 3
+init_ll.norm <- lapply(1:n_chains, function(id) initf2.norm(chain_id = id))
+```
+
+
+Run the model
+```{r}
+ml.a.4.stanfit <- stan(
+  model_code = ml.a.4.stancode,
+  data=ml.a.4.standata, 
+  control = list(max_treedepth = 15, adapt_delta=0.9),
+  init = init_ll.norm,
+  chains=3,
+  warmup=3000,
+  iter=11000,
+  cores=3
+)
+```
+
+WAIC
+```{r}
+ml.a.4.stanfit.loglik <- extract_log_lik(ml.a.4.stanfit)
+fbar <- colMeans(exp(ml.a.4.stanfit.loglik))
+Pw <- sum(apply(ml.a.4.stanfit.loglik, 2, var))
+WAIC <- -2*sum(log(fbar)) + 2*Pw
+WAIC #6808, 6780.2
+```
+
+## Model 5 -- Random age slope by marathon with heteroscedastic error variance with log(time)
+
+Stan code
+```{r}
+ml.a.5.stancode <- '
+data {
+  int<lower=1> N;                               //Number of observations
+  int<lower=1> P;                               //Number of predictors in X
+  int<lower=1> M;                               //Number of marathons
+  int<lower=1> Mp;                              //Number of marathon predictors
+  int<lower=1> R;                               //Number of runners
+  int<lower=1> VR;                              //Number of levels for vaporfly:runner
+  int<lower=1> VM;                              //Number of levels for vaporfly:marathon
+  int<lower=1, upper=M> marathon[N];            //Index of marathons
+  int<lower=1, upper=R> runner[N];              //Index of runners
+  int<lower=1, upper=VR> vaporfly_runner[N];    //Index of vaporfly:runner
+  int<lower=1, upper=VM> vaporfly_marathon[N];  //Index of vaporfly:marathon
+  matrix[N,P] X;                                //Fixed effects model matrix
+  matrix[N,Mp] Z_m;                             //Marathon-level random effects model matrix
+  vector[N] y;                                  //Response variable
+}
+
+transformed data {
+  vector[N] logy;                               //Log-transformed response variable
+
+  logy = log(y);
+}
+
+parameters {
+  vector[P] beta;                               //Vector of fixed-effects coefficients
+  real<lower=0> sigma_r;                        //Runner-level variance
+  real<lower=0> sigma_vr;                       //Vaporfly:runner-level variance
+  real<lower=0> sigma_vm;                       //Vaporfly:marathon-level variance
+  vector<lower=0>[Mp] sigma_m;                  //Vector for marathon-level variances (intercept and slope for age)
+  cholesky_factor_corr[Mp] L_m;                 //Correlation vector (Cholesky decomposition) of marathon-level intercept and slope
+  real<lower=0> sigma_e[M];                     //Error variance -- separate for each marathon
+  vector[R] r_raw;                              //Vector of unscaled runner-level random intercepts
+  vector[VR] vr_raw;                            //Vector of unscaled vaporfly:runner-level random intercepts
+  vector[VM] vm_raw;                            //Vector of unscaled vaporfly:marathon-level random intercepts
+  vector[Mp] m_raw[M];                          //Array of vectors of unscaled marathon-level random intercepts and slopes
+}
+
+transformed parameters {
+  vector[R] r;                                  //Vector of scaled runner-level random intercepts
+  vector[VR] vr;                                //Vector of scaled vaporfly:runner-level random intercepts
+  vector[VM] vm;                                //Vector of scaled vaporfly:marathon-level random intercepts
+  vector[Mp] m[M];                              //Array of vectors of scaled marathon-level random intercepts and slopes
+  
+  {
+    matrix[Mp, Mp] Sigma_m;                     //Marathon-level intercept and slope covariance matrix
+    r = sigma_r * r_raw;                        //Create scaled runner-level random intercepts
+    vr = sigma_vr * vr_raw;                     //Create scaled vaporfly:runner-level random intercepts
+    vm = sigma_vm * vm_raw;                     //Create scaled vaporfly:marathon-level random intercepts
+     
+    Sigma_m = diag_pre_multiply(sigma_m, L_m);  //Create marathon=level intercept and slope covariance matrix using Cholesky decomposition
+    for (a in 1:M) {
+      m[a] = Sigma_m * m_raw[a];                //Create scaled marathon-level random intercepts and slopes
+    }
+  }
+}
+
+model {
+  r_raw ~ std_normal();                         //Standard normal prior on unscaled runner-level random intercepts. Has effect of r ~ Normal(0, r_sigma).
+  vr_raw ~ std_normal();                        //Standard normal prior on unscaled vaporfly:runner-level random intercepts. Has effect of vr ~ Normal(0, vr_sigma).
+  vm_raw ~ std_normal();                        //Standard normal prior on unscaled vaporfly:marathon-level random intercepts. Has effect of vm ~ Normal(0, vm_sigma).
+  for (b in 1:M) {
+    m_raw[b] ~ std_normal();                    //Standard normal prior on unscaled marathon-level random intercepts. Has effect of m ~ MultivariateNormal(c(0,0), Sigma_m).
+    sigma_e[b] ~ cauchy(0,2);                   //Cauchy prior on error variance.
+  }
+  L_m ~ lkj_corr_cholesky(1);                   //LKJ prior on Cholesky correlation vector. Imposes uniform prior on correlation between intercept and slope.
+  sigma_r ~ cauchy(0,2);                        //Cauchy prior on runner-level hypervariance parameter.
+  for (c in 1:Mp) {
+    sigma_m[c] ~ cauchy(0,2);                   //Independent Cauchy priors on marathon-level intercept and slope hypervariance parameters.
+  }
+  sigma_vr ~ cauchy(0,2);                       //Cauchy prior on vaporfly:runner-level hypervariance parameter.
+  sigma_vm ~ cauchy(0,2);                       //Cauchy prior on vaporfly:marathon-level hypervariance parameter.
+  
+  //Likelihood                                  //Normal likelihood function with mixed effects linear predictor and homoscedastic error variance assumption.
+  for (i in 1:N) {
+     logy[i] ~ normal(X[i,]*beta + Z_m[i,]*m[marathon[i]] + r[runner[i]] + vr[vaporfly_runner[i]] + vm[vaporfly_marathon[i]], sigma_e[marathon[i]]);
+  }
+}
+
+generated quantities {
+  vector[N] residuals;                          //Vector for residuals
+  vector[N] yhat;                               //Vector for estimated linear predictor
+  vector[N] yhat_ppd;                           //Vector for posterior predictive distribution
+  vector[N] log_lik;                            //Vector for log-likelihood values for WAIC calculation
+  
+  for (j in 1:N) {
+    //Samples for the linear predictor yhat
+    yhat[j] = exp(X[j,]*beta + Z_m[j,]*m[marathon[j]] + r[runner[j]] + vr[vaporfly_runner[j]] + vm[vaporfly_marathon[j]]);
+    //Samples for the posterior predictive distribution, which includes error uncertainty
+    yhat_ppd[j] = normal_rng(exp(X[j,]*beta + Z_m[j,]*m[marathon[j]] + r[runner[j]] + vr[vaporfly_runner[j]] + vm[vaporfly_marathon[j]]), sigma_e[marathon[j]]);
+    //Samples of log-likelihood for WAIC calculation
+    log_lik[j] = normal_lpdf(logy[j] | (X[j,]*beta + Z_m[j,]*m[marathon[j]] + r[runner[j]] + vr[vaporfly_runner[j]] + vm[vaporfly_marathon[j]]), sigma_e[marathon[j]]);
+  }
+  
+  residuals = y - yhat;                         //Define residuals as y - hat
+
+}
+
+'
+```
+
+Define the data for stan
+```{r}
+ml.a.5.X <- model.matrix(~ vaporfly*gender + gender*age, data=shoes2)
+ml.a.5.Z_m <- model.matrix(~ 1 + age, data=shoes2)
+ml.a.5.standata <- list(
+  N = nrow(ml.a.5.X),
+  P = ncol(ml.a.5.X),
+  Mp = ncol(ml.a.5.Z_m),
+  M = length(unique(as.integer(factor(shoes2$marathon)))),
+  R = length(unique(as.integer(factor(shoes2$match_name)))),
+  VM = length(unique(as.integer(factor(shoes2$vaporfly_marathon)))),
+  VR = length(unique(as.integer(factor(shoes2$vaporfly_runner)))),
+  marathon = as.integer(factor(shoes2$marathon)),
+  runner = as.integer(factor(shoes2$match_name)),
+  vaporfly_marathon = as.integer(factor(shoes2$vaporfly_marathon)),
+  vaporfly_runner = as.integer(factor(shoes2$vaporfly_runner)),
+  X = ml.a.5.X,
+  Z_m = ml.a.5.Z_m,
+  y = shoes2$time_minutes
+)
+```
+
+Set initial values
+```{r}
+Mp = ncol(ml.a.5.Z_m)
+M = length(unique(as.integer(factor(shoes2$marathon))))
+R = length(unique(as.integer(factor(shoes2$match_name))))
+VM = length(unique(as.integer(factor(shoes2$vaporfly_marathon))))
+VR = length(unique(as.integer(factor(shoes2$vaporfly_runner))))
+marathon = as.integer(factor(shoes2$marathon))
+runner = as.integer(factor(shoes2$match_name))
+vaporfly_marathon = as.integer(factor(shoes2$vaporfly_marathon))
+vaporfly_runner = as.integer(factor(shoes2$vaporfly_runner))
+
+initf2.norm <- function(chain_id = 1) {
+  # cat("chain_id =", chain_id, "\n")
+  list(beta = array(rnorm(ncol(ml.a.5.X), sd=0.1), dim = c(ncol(ml.a.5.X))),
+       sigma_r = 1,
+       sigma_vr = 1,
+       sigma_vm = 1,
+       sigma_m = array(rlnorm(Mp, sdlog = 0.1), dim = Mp),
+       sigma_e = array(rlnorm(M, sdlog = 0.1), dim=M),
+       r_raw = array(rnorm(R, sd=0.1), dim=R),
+       vr_raw = array(rnorm(VR, sd=0.1), dim=VR),
+       vm_raw = array(rnorm(VM, sd=0.1), dim=VM),
+       m_raw = array(rnorm(M*2, sd=0.1), dim = c(M,2))
+       )
+}
+
+# generate a list of lists to specify initial values
+n_chains <- 3
+init_ll.norm <- lapply(1:n_chains, function(id) initf2.norm(chain_id = id))
+```
+
+Run the model
+```{r}
+ml.a.5.stanfit <- stan(
+  model_code = ml.a.5.stancode,
+  data=ml.a.5.standata, 
+  control = list(max_treedepth = 15, adapt_delta=0.9),
+  init = init_ll.norm,
+  chains=3,
+  warmup=3000,
+  iter=11000,
+  cores=3
+)
+```
+
+Run a loop of the model
+```{r}
+B <- 5
+ml.a.5.stanfit.list <- list(NULL)
+for (i in 1:B) {
+  ml.a.5.stanfit.list[[i]] <- stan(
+  model_code = ml.a.5.stancode,
+  data=ml.a.5.standata, 
+  control = list(max_treedepth = 15, adapt_delta=0.9),
+  init = init_ll.norm,
+  chains=3,
+  warmup=1000,
+  iter=4000,
+  cores=3
+)
+}
+
+ml.a.5.log.lik.list <- lapply(ml.a.5.stanfit.list, FUN = extract_log_lik)
+ml.a.5.fbar.list <- lapply(ml.a.5.log.lik.list, FUN = function(x) colMeans(exp(x)))
+ml.a.5.Pw.list <- lapply(ml.a.5.log.lik.list, FUN = function(x) sum(apply(x, 2, var)))
+ml.a.5.WAIC.1.list <- lapply(ml.a.5.fbar.list, FUN = function(x) -2*sum(log(x)))
+ml.a.5.WAIC.2.list <- lapply(ml.a.5.Pw.list, FUN = function(x) 2*x)
+ml.a.5.WAIC <- 1:B
+for (i in 1:B) {
+  ml.a.5.WAIC[i] <- ml.a.5.WAIC.1.list[[i]] + ml.a.5.WAIC.2.list[[i]]
+}
+(ml.a.5.WAIC.quant <- quantile(probs = c(0.025, 0.975), c(ml.a.5.WAIC, -4480)))
+write.csv(ml.a.5.WAIC.quant, file="/Users/tschappe/Documents/NC\ State\ Classes/ST540/Take\ Home\ Exam/ml.a.5.WAIC.quant.csv")
+```
+
+WAIC
+```{r}
+ml.a.5.stanfit.loglik <- extract_log_lik(ml.a.5.stanfit)
+fbar <- colMeans(exp(ml.a.5.stanfit.loglik))
+Pw <- sum(apply(ml.a.5.stanfit.loglik, 2, var))
+WAIC <- -2*sum(log(fbar)) + 2*Pw
+WAIC #-4474, -4478.8, -4480.2
+```
+
+Residuals
+```{r}
+#Extract summary of draws of the residuals
+ml.a.5.resids <- summary(ml.a.5.stanfit, pars = c("residuals"), probs=0.5)$summary
+#Take the mean of the draws for each residual and studentize them
+ml.a.5.student.resids <- ml.a.5.resids[,1]/sd(ml.a.5.resids[,1])
+#Make a density plot of the studentized residuals and random t-distribution variates
+normal.resid <- data.frame(rand.norm=rnorm(n=length(ml.a.5.student.resids)), ml.a.5.student.resids = ml.a.5.student.resids)
+normal.resid.melt <- melt(normal.resid)
+ggplot(normal.resid.melt, aes(x=value, alpha=0.3, fill=variable))+
+  geom_density()+
+  scale_fill_discrete(name="Data", labels = c("Normal variates", "Studentized model residuals"))+
+  scale_alpha_continuous(guide = F)
+#Make a qqplot comparing the residuals to quantiles from a standard normal
+qqnorm(ml.a.5.student.resids); qqline(ml.a.5.student.resids)
+```
+
+Posterior predictive checks
+```{r}
+ml.a.5.yhat_ppd <- (as.data.frame(ml.a.5.stanfit, pars = c("yhat_ppd")))
+ppd.df <- data.frame(mean=apply(ml.a.5.yhat_ppd, 1, mean))
+ppd.df$min <- apply(ml.a.5.yhat_ppd, 1, min)
+ppd.df$max <- apply(ml.a.5.yhat_ppd, 1, max)
+ppd.df$median <- apply(ml.a.5.yhat_ppd, 1, median)
+ppd.df$range <- ppd.df$max - ppd.df$min
+ppd.df.melt <- melt(ppd.df)
+qplot(mean, geom="density", data=ppd.df)+
+  geom_vline(xintercept=mean((shoes2$time_minutes)))+
+  scale_x_continuous(limits = c(115, 150))
+qplot(median, geom="density", data=ppd.df)+
+  geom_vline(xintercept=median((shoes2$time_minutes)))+
+  scale_x_continuous(limits = c(115, 150))
+qplot(min, geom="density", data=ppd.df)+
+  geom_vline(xintercept=min((shoes2$time_minutes)))+
+  scale_x_continuous(limits = c(115, 150))
+qplot(max, geom="density", data=ppd.df)+
+  geom_vline(xintercept=max((shoes2$time_minutes)))+
+  scale_x_continuous(limits = c(160, 190))
+qplot(range, geom="density", data=ppd.df)+
+  geom_vline(xintercept=max((shoes2$time_minutes)) - min((shoes2$time_minutes)))+
+  scale_x_continuous(limits = c(25, 75))
+
+#Calculate p-values
+ml.a.5.ppd.pvals <- as.data.frame(
+  c(
+    mean(ppd.df$mean > mean(shoes2$time_minutes)),
+    mean(ppd.df$median > median(shoes2$time_minutes)),
+    mean(ppd.df$min > min(shoes2$time_minutes)),
+    mean(ppd.df$max > max(shoes2$time_minutes)),
+    mean(ppd.df$range > range(shoes2$time_minutes))
+  )
+)
+ml.a.5.ppd.pvals <- t(ml.a.5.ppd.pvals)
+colnames(ml.a.5.ppd.pvals) <- c("Mean", "Median", "Min", "Max", "Range")
+rownames(ml.a.5.ppd.pvals) <- c("Bayesian p-value")
+ml.a.5.ppd.pvals
+write.csv(ml.a.5.ppd.pvals, file="/Users/tschappe/Documents/NC\ State\ Classes/ST540/Take\ Home\ Exam/ml.a.5.ppd.pvals.csv")
+```
+
+MSE and MAD
+```{r}
+ml.a.5.MSE.ppd <- apply(apply(ml.a.5.yhat_ppd, 1, FUN = function(x) (x-shoes2$time_minutes)^2), 2, mean)
+ml.a.5.MAD.ppd <- apply(apply(ml.a.5.yhat_ppd, 1, FUN = function(x) abs(x-shoes2$time_minutes)), 2, mean)
+(ml.a.5.MAD.MSE.quant <- rbind(quantile(ml.a.5.MSE.ppd, probs = c(0.025, 0.975)), quantile(ml.a.5.MAD.ppd, probs = c(0.025, 0.975))))
+write.csv(ml.a.5.MAD.MSE.quant, file="/Users/tschappe/Documents/NC\ State\ Classes/ST540/Take\ Home\ Exam/ml.a.5.MAD.MSE.quant.csv")
+```
+
+Table of quantiles for Vaporfly:gender
+```{r}
+ml.a.5.beta <- (as.data.frame(ml.a.5.stanfit, pars = c("beta")))
+c(mean(ml.a.5.beta[,2]), mean(ml.a.5.beta[,5]))
+c(median(ml.a.5.beta[,2]), median(ml.a.5.beta[,5]))
+HDInterval::hdi(ml.a.5.beta[,2], credMass=0.95)
+HDInterval::hdi(ml.a.5.beta[,5], credMass=0.95)
+```
+
+
+## Model 6 -- Random age slope by marathon with heteroscedastic error variance with log(time) with student-t likelihood
+
+Stan code
+```{r}
+ml.a.6.stancode <- "
+data {
+  int<lower=1> N;                               //Number of observations
+  int<lower=1> P;                               //Number of predictors in X
+  int<lower=1> M;                               //Number of marathons
+  int<lower=1> Mp;                              //Number of marathon predictors
+  int<lower=1> R;                               //Number of runners
+  int<lower=1> VR;                              //Number of levels for vaporfly:runner
+  int<lower=1> VM;                              //Number of levels for vaporfly:marathon
+  int<lower=1, upper=M> marathon[N];            //Index of marathons
+  int<lower=1, upper=R> runner[N];              //Index of runners
+  int<lower=1, upper=VR> vaporfly_runner[N];    //Index of vaporfly:runner
+  int<lower=1, upper=VM> vaporfly_marathon[N];  //Index of vaporfly:marathon
+  matrix[N,P] X;                                //Fixed effects model matrix
+  matrix[N,Mp] Z_m;                             //Marathon-level random effects model matrix
+  vector[N] y;                                  //Response variable
+}
+
+transformed data {
+  vector[N] logy;                               //Log-transformed response variable
+
+  logy = log(y);
+}
+
+parameters {
+  vector[P] beta;                               //Vector of fixed-effects coefficients
+  real<lower=0> sigma_r;                        //Runner-level variance
+  real<lower=0> sigma_vr;                       //Vaporfly:runner-level variance
+  real<lower=0> sigma_vm;                       //Vaporfly:marathon-level variance
+  vector<lower=0>[Mp] sigma_m;                  //Vector for marathon-level variances (intercept and slope for age)
+  cholesky_factor_corr[Mp] L_m;                 //Cholesky decomposition of correlation matrix for marathon-level intercept and slope [2 x 2]
+  real<lower=0> sigma_e[M];                     //Error variance -- separate for each marathon
+  vector[R] r_raw;                              //Vector of unscaled runner-level random intercepts
+  vector[VR] vr_raw;                            //Vector of unscaled vaporfly:runner-level random intercepts
+  vector[VM] vm_raw;                            //Vector of unscaled vaporfly:marathon-level random intercepts
+  vector[Mp] m_raw[M];                          //Array of vectors of unscaled marathon-level random intercepts and slopes
+  real<lower=1> nu;                             //Degrees-of-freedom parameter for student-t likelihood
+}
+
+transformed parameters {
+  vector[R] r;                                  //Vector of scaled runner-level random intercepts
+  vector[VR] vr;                                //Vector of scaled vaporfly:runner-level random intercepts
+  vector[VM] vm;                                //Vector of scaled vaporfly:marathon-level random intercepts
+  vector[Mp] m[M];                              //Array of vectors of scaled marathon-level random intercepts and slopes
+  
+  {
+    matrix[Mp, Mp] Sigma_m;                     //Marathon-level intercept and slope covariance matrix
+    r = sigma_r * r_raw;                        //Create scaled runner-level random intercepts
+    vr = sigma_vr * vr_raw;                     //Create scaled vaporfly:runner-level random intercepts
+    vm = sigma_vm * vm_raw;                     //Create scaled vaporfly:marathon-level random intercepts
+     
+    Sigma_m = diag_pre_multiply(sigma_m, L_m);  //Create marathon=level intercept and slope covariance matrix using Cholesky decomposition
+    for (a in 1:M) {
+      m[a] = Sigma_m * m_raw[a];                //Create scaled marathon-level random intercepts and slopes
+    }
+  }
+}
+
+model {
+  r_raw ~ std_normal();                         //Standard normal prior on unscaled runner-level random intercepts. Has effect of r ~ Normal(0, r_sigma).
+  vr_raw ~ std_normal();                        //Standard normal prior on unscaled vaporfly:runner-level random intercepts. Has effect of vr ~ Normal(0, vr_sigma).
+  vm_raw ~ std_normal();                        //Standard normal prior on unscaled vaporfly:marathon-level random intercepts. Has effect of vm ~ Normal(0, vm_sigma).
+  for (b in 1:M) {
+    to_vector(m_raw[b]) ~ std_normal();         //Independent standard normal priors on unscaled marathon-level random intercepts. Has effect of m ~ MultivariateNormal(c(0,0), Sigma_m).
+    sigma_e[b] ~ cauchy(0,2);                   //Independent Cauchy priors on error variances for each marathon.
+  }
+  L_m ~ lkj_corr_cholesky(1);                   //LKJ prior on Cholesky correlation vector. With nu=1, imposes nearly uniform prior on correlation between intercept and slope.
+  sigma_r ~ cauchy(0,2);                        //Cauchy prior on runner-level hypervariance parameter.
+  for (c in 1:Mp) {
+    sigma_m[c] ~ cauchy(0,2);                   //Independent Cauchy priors on marathon-level intercept and slope hypervariance parameters.
+  }
+  sigma_vr ~ cauchy(0,2);                       //Cauchy prior on vaporfly:runner-level hypervariance parameter.
+  sigma_vm ~ cauchy(0,2);                       //Cauchy prior on vaporfly:marathon-level hypervariance parameter.
+  
+  //Likelihood                                  //Normal likelihood function with mixed effects linear predictor and homoscedastic error variance assumption.
+  for (i in 1:N) {
+     logy[i] ~ student_t(nu, X[i,]*beta + Z_m[i,]*m[marathon[i]] + r[runner[i]] + vr[vaporfly_runner[i]] + vm[vaporfly_marathon[i]], sigma_e[marathon[i]]);
+  }
+}
+
+generated quantities {
+  vector[N] residuals;                          //Vector for residuals
+  vector[N] yhat;                               //Vector for estimated linear predictor
+  vector[N] yhat_ppd;                           //Vector for posterior predictive distribution
+  vector[N] log_lik;                            //Vector for log-likelihood values for WAIC calculation
+  
+  for (j in 1:N) {
+    //Samples for the linear predictor yhat
+    yhat[j] = exp(X[j,]*beta + Z_m[j,]*m[marathon[j]] + r[runner[j]] + vr[vaporfly_runner[j]] + vm[vaporfly_marathon[j]]);
+    //Samples for the posterior predictive distribution, which includes error uncertainty
+    yhat_ppd[j] = student_t_rng(nu, exp(X[j,]*beta + Z_m[j,]*m[marathon[j]] + r[runner[j]] + vr[vaporfly_runner[j]] + vm[vaporfly_marathon[j]]), sigma_e[marathon[j]]);
+    //Samples of log-likelihood for WAIC calculation
+    log_lik[j] = student_t_lpdf(logy[j] | nu, (X[j,]*beta + Z_m[j,]*m[marathon[j]] + r[runner[j]] + vr[vaporfly_runner[j]] + vm[vaporfly_marathon[j]]), sigma_e[marathon[j]]);
+  }
+  
+  residuals = y - yhat;                         //Define residuals as y - hat
+
+}
+
+"
+```
+
+Define the data for stan
+```{r}
+ml.a.6.X <- model.matrix(~ vaporfly*gender + gender*age, data=shoes2)
+ml.a.6.Z_m <- model.matrix(~ 1 + age, data=shoes2)
+ml.a.6.standata <- list(
+  N = nrow(ml.a.6.X),
+  P = ncol(ml.a.6.X),
+  Mp = ncol(ml.a.6.Z_m),
+  M = length(unique(as.integer(factor(shoes2$marathon)))),
+  R = length(unique(as.integer(factor(shoes2$match_name)))),
+  VM = length(unique(as.integer(factor(shoes2$vaporfly_marathon)))),
+  VR = length(unique(as.integer(factor(shoes2$vaporfly_runner)))),
+  marathon = as.integer(factor(shoes2$marathon)),
+  runner = as.integer(factor(shoes2$match_name)),
+  vaporfly_marathon = as.integer(factor(shoes2$vaporfly_marathon)),
+  vaporfly_runner = as.integer(factor(shoes2$vaporfly_runner)),
+  X = ml.a.6.X,
+  Z_m = ml.a.6.Z_m,
+  y = shoes2$time_minutes
+)
+```
+
+Set initial values
+```{r}
+Mp = ncol(ml.a.6.Z_m)
+M = length(unique(as.integer(factor(shoes2$marathon))))
+R = length(unique(as.integer(factor(shoes2$match_name))))
+VM = length(unique(as.integer(factor(shoes2$vaporfly_marathon))))
+VR = length(unique(as.integer(factor(shoes2$vaporfly_runner))))
+marathon = as.integer(factor(shoes2$marathon))
+runner = as.integer(factor(shoes2$match_name))
+vaporfly_marathon = as.integer(factor(shoes2$vaporfly_marathon))
+vaporfly_runner = as.integer(factor(shoes2$vaporfly_runner))
+
+initf2 <- function(chain_id = 1) {
+  # cat("chain_id =", chain_id, "\n")
+  list(beta = array(rnorm(ncol(ml.a.6.X), sd=0.1), dim = c(ncol(ml.a.6.X))),
+       sigma_r = 1,
+       sigma_vr = 1,
+       sigma_vm = 1,
+       sigma_m = array(rlnorm(Mp, sdlog = 0.1), dim = Mp),
+       sigma_e = array(rlnorm(M, sdlog = 0.1), dim=M),
+       r_raw = array(rnorm(R, sd=0.1), dim=R),
+       vr_raw = array(rnorm(VR, sd=0.1), dim=VR),
+       vm_raw = array(rnorm(VM, sd=0.1), dim=VM),
+       m_raw = array(rnorm(M*2, sd=0.1), dim = c(M,2)),
+       nu = 1.1
+       )
+}
+
+# generate a list of lists to specify initial values
+n_chains <- 4
+init_ll <- lapply(1:n_chains, function(id) initf2(chain_id = id))
+```
+
+
+Run the model
+```{r}
+ml.a.6.stanfit <- stan(
+  model_code = ml.a.6.stancode,
+  data=ml.a.6.standata, 
+  control = list(max_treedepth = 15, adapt_delta=0.9),
+  init = init_ll,
+  chains=3,
+  warmup=2000,
+  iter=18000,
+  cores=3
+)
+```
+
+WAIC
+```{r}
+ml.a.6.stanfit.loglik <- extract_log_lik(ml.a.6.stanfit)
+fbar <- colMeans(exp(ml.a.6.stanfit.loglik))
+Pw <- sum(apply(ml.a.6.stanfit.loglik, 2, var))
+WAIC <- -2*sum(log(fbar)) + 2*Pw
+WAIC #-4517, -4518.375, -4524.9, -4527.1, -4525.9
+```
+
+This is the best-fitting model yet, so let's go with this one.
+
+Look at MCMC chain convergence
+```{r}
+#Look at traceplots
+plot(ml.a.6.stanfit, plotfun = "trace", pars = c("beta"))
+plot(ml.a.6.stanfit, plotfun = "trace", pars = c("m"))
+plot(ml.a.6.stanfit, plotfun = "trace", pars = c("sigma_e"))
+#Looks like the chains mixed well
+
+#Look at Gelman-Rubin statistic -- exclude NAs because the Cholesky factorization of the correlation matrix has 1 and 0 by definition, so their GR statistics are N/A
+c(min(na.exclude(summary(ml.a.6.stanfit)$summary[,10])), max(na.exclude(summary(ml.a.6.stanfit)$summary[,10])))
+#Look at the min ESS
+summary(na.exclude(summary(ml.a.6.stanfit, pars = c("beta","r","m","vr","vm","sigma_r","sigma_vr","sigma_vm","sigma_m","sigma_e","nu"))$summary[,9]))
+```
+
+
+Residuals
+```{r}
+#Extract summary of draws of the residuals
+ml.a.6.resids <- summary(ml.a.6.stanfit, pars = c("residuals"), probs=0.5)$summary
+#Take the mean of the draws for each residual and studentize them
+ml.a.6.student.resids <- ml.a.6.resids[,1]/sd(ml.a.6.resids[,1])
+#Extract degrees-of-freedom draws
+ml.a.6.nu <- summary(ml.a.6.stanfit, pars = c("nu"), probs=0.5)$summary
+#Make a density plot of the studentized residuals and random t-distribution variates
+student.resid <- data.frame(student=rt(n=length(ml.a.6.student.resids), df=ml.a.6.nu[,1]), ml.a.6.student.resids = ml.a.6.student.resids)
+student.resid.melt <- melt(student.resid)
+ggplot(student.resid.melt, aes(x=value, alpha=0.3, fill=variable))+
+  geom_density()+
+  scale_fill_discrete(name="Data", labels = c("Student-t variates", "Studentized model residuals"))+
+  scale_alpha_continuous(guide = F)
+#Make a qqplot comparing the residuals to draws from a student-t distribution with the same degrees of freedom as our estimate
+qqplot(qt(ppoints(nrow(shoes2)), df = ml.a.6.nu[,1]), ml.a.6.student.resids, xlab="Theoretical Quantiles", ylab="Sample Quantiles", main="Student-t Q-Q Plot"); qqline(ml.a.6.student.resids, distribution=function(p) qt(p, df=ml.a.6.nu[,1]), probs=c(0.025, 0.975), col=1)
+```
+
+Posterior predictive checks
+```{r}
+ml.a.6.yhat_ppd <- (as.data.frame(ml.a.6.stanfit, pars = c("yhat_ppd")))
+ppd.df <- data.frame(mean=apply(ml.a.6.yhat_ppd, 1, mean))
+ppd.df$min <- apply(ml.a.6.yhat_ppd, 1, min)
+ppd.df$max <- apply(ml.a.6.yhat_ppd, 1, max)
+ppd.df$median <- apply(ml.a.6.yhat_ppd, 1, median)
+ppd.df$range <- ppd.df$max - ppd.df$min
+ppd.df.melt <- melt(ppd.df)
+qplot(mean, geom="density", data=ppd.df)+
+  geom_vline(xintercept=mean((shoes2$time_minutes)))+
+  scale_x_continuous(limits = c(115, 150))
+qplot(median, geom="density", data=ppd.df)+
+  geom_vline(xintercept=median((shoes2$time_minutes)))+
+  scale_x_continuous(limits = c(115, 150))
+qplot(min, geom="density", data=ppd.df)+
+  geom_vline(xintercept=min((shoes2$time_minutes)))+
+  scale_x_continuous(limits = c(115, 150))
+qplot(max, geom="density", data=ppd.df)+
+  geom_vline(xintercept=max((shoes2$time_minutes)))+
+  scale_x_continuous(limits = c(160, 190))
+qplot(range, geom="density", data=ppd.df)+
+  geom_vline(xintercept=max((shoes2$time_minutes)) - min((shoes2$time_minutes)))+
+  scale_x_continuous(limits = c(25, 75))
+
+#Calculate p-values
+ppd.pvals <- as.data.frame(
+  c(
+    mean(ppd.df$mean > mean(shoes2$time_minutes)),
+    mean(ppd.df$median > median(shoes2$time_minutes)),
+    mean(ppd.df$min > min(shoes2$time_minutes)),
+    mean(ppd.df$max > max(shoes2$time_minutes)),
+    mean(ppd.df$range > range(shoes2$time_minutes))
+  )
+)
+ppd.pvals <- t(ppd.pvals)  
+colnames(ppd.pvals) <- c("Mean", "Median", "Min", "Max", "Range")
+rownames(ppd.pvals) <- c("Bayesian p-value")
+ml.a.6.ppd.pvals <- ppd.pvals
+write.csv(ml.a.6.ppd.pvals, file="/Users/tschappe/Documents/NC\ State\ Classes/ST540/Take\ Home\ Exam/ml.a.6.ppd.pvals.csv")
+```
+
+MSE and MAD
+```{r}
+ml.a.6.MSE.ppd <- apply(apply(ml.a.6.yhat_ppd, 1, FUN = function(x) (x-shoes2$time_minutes)^2), 2, mean)
+ml.a.6.MAD.ppd <- apply(apply(ml.a.6.yhat_ppd, 1, FUN = function(x) abs(x-shoes2$time_minutes)), 2, mean)
+(ml.a.6.MAD.MSE.quant <- rbind(quantile(ml.a.6.MSE.ppd, probs = c(0.025, 0.975)), quantile(ml.a.6.MAD.ppd, probs = c(0.025, 0.975))))
+write.csv(ml.a.6.MAD.MSE.quant, file="/Users/tschappe/Documents/NC\ State\ Classes/ST540/Take\ Home\ Exam/ml.a.6.MAD.MSE.quant.csv")
+```
+
+Look at results
+```{r}
+print(ml.a.6.stanfit, pars = c("beta"))
+print(ml.a.6.stanfit, pars = c("r"))
+print(ml.a.6.stanfit, pars = c("m"))
+print(ml.a.6.stanfit, pars = c("vr"))
+print(ml.a.6.stanfit, pars = c("vm"))
+print(ml.a.6.stanfit, pars = c("L_m"))
+print(ml.a.6.stanfit, pars = c("sigma_m"))
+print(ml.a.6.stanfit, pars = c("sigma_r"))
+print(ml.a.6.stanfit, pars = c("sigma_vr"))
+print(ml.a.6.stanfit, pars = c("sigma_vm"))
+print(ml.a.6.stanfit, pars = c("sigma_e"))
+print(ml.a.6.stanfit, pars = c("yhat"))
+print(ml.a.6.stanfit, pars = c("residuals"))
+```
+
+```{r}
+L = as.matrix(rbind(c(1,0), c(0.2, sqrt(1-0.2^2))))
+tau = as.matrix(rbind(c(1.2,0), c(0, 1.8)))
+corr.mat <- tau %*% L
+cov.mat <- corr.mat %*% t(corr.mat) 
+corr.mat
+cov.mat
+```
+
+## Model 5 Vapor:Runner reduced
+
+Stan code
+```{r}
+ml.a.5.vr.red.stancode <- '
+data {
+  int<lower=1> N;                               //Number of observations
+  int<lower=1> P;                               //Number of predictors in X
+  int<lower=1> M;                               //Number of marathons
+  int<lower=1> Mp;                              //Number of marathon predictors
+  int<lower=1> R;                               //Number of runners
+  //int<lower=1> VR;                              //Number of levels for vaporfly:runner
+  int<lower=1> VM;                              //Number of levels for vaporfly:marathon
+  int<lower=1, upper=M> marathon[N];            //Index of marathons
+  int<lower=1, upper=R> runner[N];              //Index of runners
+  //int<lower=1, upper=VR> vaporfly_runner[N];    //Index of vaporfly:runner
+  int<lower=1, upper=VM> vaporfly_marathon[N];  //Index of vaporfly:marathon
+  matrix[N,P] X;                                //Fixed effects model matrix
+  matrix[N,Mp] Z_m;                             //Marathon-level random effects model matrix
+  vector[N] y;                                  //Response variable
+}
+
+transformed data {
+  vector[N] logy;                               //Log-transformed response variable
+
+  logy = log(y);
+}
+
+parameters {
+  vector[P] beta;                               //Vector of fixed-effects coefficients
+  real<lower=0> sigma_r;                        //Runner-level variance
+  //real<lower=0> sigma_vr;                       //Vaporfly:runner-level variance
+  real<lower=0> sigma_vm;                       //Vaporfly:marathon-level variance
+  vector<lower=0>[Mp] sigma_m;                  //Vector for marathon-level variances (intercept and slope for age)
+  cholesky_factor_corr[Mp] L_m;                 //Correlation vector (Cholesky decomposition) of marathon-level intercept and slope
+  real<lower=0> sigma_e[M];                     //Error variance -- separate for each marathon
+  vector[R] r_raw;                              //Vector of unscaled runner-level random intercepts
+  //vector[VR] vr_raw;                            //Vector of unscaled vaporfly:runner-level random intercepts
+  vector[VM] vm_raw;                            //Vector of unscaled vaporfly:marathon-level random intercepts
+  vector[Mp] m_raw[M];                          //Array of vectors of unscaled marathon-level random intercepts and slopes
+}
+
+transformed parameters {
+  vector[R] r;                                  //Vector of scaled runner-level random intercepts
+  //vector[VR] vr;                                //Vector of scaled vaporfly:runner-level random intercepts
+  vector[VM] vm;                                //Vector of scaled vaporfly:marathon-level random intercepts
+  vector[Mp] m[M];                              //Array of vectors of scaled marathon-level random intercepts and slopes
+  
+  {
+    matrix[Mp, Mp] Sigma_m;                     //Marathon-level intercept and slope covariance matrix
+    r = sigma_r * r_raw;                        //Create scaled runner-level random intercepts
+    //vr = sigma_vr * vr_raw;                     //Create scaled vaporfly:runner-level random intercepts
+    vm = sigma_vm * vm_raw;                     //Create scaled vaporfly:marathon-level random intercepts
+     
+    Sigma_m = diag_pre_multiply(sigma_m, L_m);  //Create marathon=level intercept and slope covariance matrix using Cholesky decomposition
+    for (a in 1:M) {
+      m[a] = Sigma_m * m_raw[a];                //Create scaled marathon-level random intercepts and slopes
+    }
+  }
+}
+
+model {
+  r_raw ~ std_normal();                         //Standard normal prior on unscaled runner-level random intercepts. Has effect of r ~ Normal(0, r_sigma).
+  //vr_raw ~ std_normal();                        //Standard normal prior on unscaled vaporfly:runner-level random intercepts. Has effect of vr ~ Normal(0, vr_sigma).
+  vm_raw ~ std_normal();                        //Standard normal prior on unscaled vaporfly:marathon-level random intercepts. Has effect of vm ~ Normal(0, vm_sigma).
+  for (b in 1:M) {
+    to_vector(m_raw[b]) ~ std_normal();         //Standard normal prior on unscaled marathon-level random intercepts. Has effect of m ~ MultivariateNormal(c(0,0), Sigma_m).
+    sigma_e[b] ~ cauchy(0,2);                   //Independent Cauchy priors on error variances for each marathon.
+  }
+  L_m ~ lkj_corr_cholesky(1);                   //LKJ prior on Cholesky correlation vector. Imposes uniform prior on correlation between intercept and slope.
+  sigma_r ~ cauchy(0,2);                        //Cauchy prior on runner-level hypervariance parameter.
+  for (c in 1:Mp) {
+    sigma_m[c] ~ cauchy(0,2);                   //Independent Cauchy priors on marathon-level intercept and slope hypervariance parameters.
+  }
+  //sigma_vr ~ cauchy(0,2);                       //Cauchy prior on vaporfly:runner-level hypervariance parameter.
+  sigma_vm ~ cauchy(0,2);                       //Cauchy prior on vaporfly:marathon-level hypervariance parameter.
+  
+  //Likelihood                                  //Normal likelihood function with mixed effects linear predictor and homoscedastic error variance assumption.
+  for (i in 1:N) {
+     logy[i] ~ normal(X[i,]*beta + Z_m[i,]*m[marathon[i]] + r[runner[i]] + vm[vaporfly_marathon[i]], sigma_e[marathon[i]]);
+  }
+}
+
+generated quantities {
+  vector[N] residuals;                          //Vector for residuals
+  vector[N] yhat;                               //Vector for estimated linear predictor
+  vector[N] yhat_ppd;                           //Vector for posterior predictive distribution
+  vector[N] log_lik;                            //Vector for log-likelihood values for WAIC calculation
+  
+  for (j in 1:N) {
+    //Samples for the linear predictor yhat
+    yhat[j] = exp(X[j,]*beta + Z_m[j,]*m[marathon[j]] + r[runner[j]] + vm[vaporfly_marathon[j]]);
+    //Samples for the posterior predictive distribution, which includes error uncertainty
+    yhat_ppd[j] = normal_rng(exp(X[j,]*beta + Z_m[j,]*m[marathon[j]] + r[runner[j]] + vm[vaporfly_marathon[j]]), sigma_e[marathon[j]]);
+    //Samples of log-likelihood for WAIC calculation
+    log_lik[j] = normal_lpdf(logy[j] | (X[j,]*beta + Z_m[j,]*m[marathon[j]] + r[runner[j]] + vm[vaporfly_marathon[j]]), sigma_e[marathon[j]]);
+  }
+  
+  residuals = y - yhat;                         //Define residuals as y - hat
+
+}
+
+'
+```
+
+Define the data for stan
+```{r}
+ml.a.5.vr.red.X <- model.matrix(~ vaporfly*gender + gender*age, data=shoes2)
+ml.a.5.vr.red.Z_m <- model.matrix(~ 1 + age, data=shoes2)
+ml.a.5.vr.red.standata <- list(
+  N = nrow(ml.a.5.vr.red.X),
+  P = ncol(ml.a.5.vr.red.X),
+  Mp = ncol(ml.a.5.vr.red.Z_m),
+  M = length(unique(as.integer(factor(shoes2$marathon)))),
+  R = length(unique(as.integer(factor(shoes2$match_name)))),
+  VM = length(unique(as.integer(factor(shoes2$vaporfly_marathon)))),
+  #VR = length(unique(as.integer(factor(shoes2$vaporfly_runner)))),
+  marathon = as.integer(factor(shoes2$marathon)),
+  runner = as.integer(factor(shoes2$match_name)),
+  vaporfly_marathon = as.integer(factor(shoes2$vaporfly_marathon)),
+  #vaporfly_runner = as.integer(factor(shoes2$vaporfly_runner)),
+  X = ml.a.5.vr.red.X,
+  Z_m = ml.a.5.vr.red.Z_m,
+  y = shoes2$time_minutes
+)
+```
+
+Set initial values
+```{r}
+Mp = ncol(ml.a.5.vr.red.Z_m)
+M = length(unique(as.integer(factor(shoes2$marathon))))
+R = length(unique(as.integer(factor(shoes2$match_name))))
+VM = length(unique(as.integer(factor(shoes2$vaporfly_marathon))))
+VR = length(unique(as.integer(factor(shoes2$vaporfly_runner))))
+marathon = as.integer(factor(shoes2$marathon))
+runner = as.integer(factor(shoes2$match_name))
+vaporfly_marathon = as.integer(factor(shoes2$vaporfly_marathon))
+vaporfly_runner = as.integer(factor(shoes2$vaporfly_runner))
+
+initf2.norm <- function(chain_id = 1) {
+  # cat("chain_id =", chain_id, "\n")
+  list(beta = array(rnorm(ncol(ml.a.6.X), sd=0.1), dim = c(ncol(ml.a.6.X))),
+       sigma_r = 1,
+       #sigma_vr = 1,
+       sigma_vm = 1,
+       sigma_m = array(rlnorm(Mp, sdlog = 0.1), dim = Mp),
+       sigma_e = array(rlnorm(M, sdlog = 0.1), dim=M),
+       r_raw = array(rnorm(R, sd=0.1), dim=R),
+       #vr_raw = array(rnorm(VR, sd=0.1), dim=VR),
+       vm_raw = array(rnorm(VM, sd=0.1), dim=VM),
+       m_raw = array(rnorm(M*2, sd=0.1), dim = c(M,2))
+       )
+}
+
+# generate a list of lists to specify initial values
+n_chains <- 3
+init_ll.norm <- lapply(1:n_chains, function(id) initf2.norm(chain_id = id))
+```
+
+Run the model
+```{r}
+ml.a.5.vr.red.stanfit <- stan(
+  model_code = ml.a.5.vr.red.stancode,
+  data=ml.a.5.vr.red.standata, 
+  control = list(max_treedepth = 15, adapt_delta=0.9),
+  init = init_ll.norm,
+  chains=3,
+  warmup=3000,
+  iter=11000,
+  cores=3
+)
+```
+
+Run a loop of the model and calculate WAIC for each one
+```{r}
+B <- 5
+ml.a.5.vr.red.stanfit.list <- list(NULL)
+for (i in 1:B) {
+  ml.a.5.vr.red.stanfit.list[[i]] <- stan(
+  model_code = ml.a.5.vr.red.stancode,
+  data=ml.a.5.vr.red.standata, 
+  control = list(max_treedepth = 15, adapt_delta=0.9),
+  init = init_ll.norm,
+  chains=3,
+  warmup=1000,
+  iter=4000,
+  cores=3
+)
+}
+
+ml.a.5.vr.red.log.lik.list <- lapply(ml.a.5.vr.red.stanfit.list, FUN = extract_log_lik)
+ml.a.5.vr.red.fbar.list <- lapply(ml.a.5.vr.red.log.lik.list, FUN = function(x) colMeans(exp(x)))
+ml.a.5.vr.red.Pw.list <- lapply(ml.a.5.vr.red.log.lik.list, FUN = function(x) sum(apply(x, 2, var)))
+ml.a.5.vr.red.WAIC.1.list <- lapply(ml.a.5.vr.red.fbar.list, FUN = function(x) -2*sum(log(x)))
+ml.a.5.vr.red.WAIC.2.list <- lapply(ml.a.5.vr.red.Pw.list, FUN = function(x) 2*x)
+ml.a.5.vr.red.WAIC <- 1:B
+for (i in 1:B) {
+  ml.a.5.vr.red.WAIC[i] <- ml.a.5.vr.red.WAIC.1.list[[i]] + ml.a.5.vr.red.WAIC.2.list[[i]]
+}
+(ml.a.5.vr.red.WAIC.quant <- quantile(probs = c(0.025, 0.975), ml.a.5.vr.red.WAIC))
+write.csv(ml.a.5.vr.red.WAIC.quant, file="/Users/tschappe/Documents/NC\ State\ Classes/ST540/Take\ Home\ Exam/ml.a.5.vr.red.WAIC.quant.csv")
+```
+
+WAIC
+```{r}
+ml.a.5.vr.red.loglik <- extract_log_lik(ml.a.5.vr.red.stanfit)
+fbar <- colMeans(exp(ml.a.5.vr.red.loglik))
+Pw <- sum(apply(ml.a.5.vr.red.loglik, 2, var))
+WAIC <- -2*sum(log(fbar)) + 2*Pw
+WAIC #-4461
+```
+
+## Model 5 Vapor:Marathon reduced
+
+Stan code
+```{r}
+ml.a.5.vm.red.stancode <- '
+data {
+  int<lower=1> N;                               //Number of observations
+  int<lower=1> P;                               //Number of predictors in X
+  int<lower=1> M;                               //Number of marathons
+  int<lower=1> Mp;                              //Number of marathon predictors
+  int<lower=1> R;                               //Number of runners
+  int<lower=1> VR;                              //Number of levels for vaporfly:runner
+  //int<lower=1> VM;                              //Number of levels for vaporfly:marathon
+  int<lower=1, upper=M> marathon[N];            //Index of marathons
+  int<lower=1, upper=R> runner[N];              //Index of runners
+  int<lower=1, upper=VR> vaporfly_runner[N];    //Index of vaporfly:runner
+  //int<lower=1, upper=VM> vaporfly_marathon[N];  //Index of vaporfly:marathon
+  matrix[N,P] X;                                //Fixed effects model matrix
+  matrix[N,Mp] Z_m;                             //Marathon-level random effects model matrix
+  vector[N] y;                                  //Response variable
+}
+
+transformed data {
+  vector[N] logy;                               //Log-transformed response variable
+
+  logy = log(y);
+}
+
+parameters {
+  vector[P] beta;                               //Vector of fixed-effects coefficients
+  real<lower=0> sigma_r;                        //Runner-level variance
+  real<lower=0> sigma_vr;                       //Vaporfly:runner-level variance
+  //real<lower=0> sigma_vm;                       //Vaporfly:marathon-level variance
+  vector<lower=0>[Mp] sigma_m;                  //Vector for marathon-level variances (intercept and slope for age)
+  cholesky_factor_corr[Mp] L_m;                 //Correlation vector (Cholesky decomposition) of marathon-level intercept and slope
+  real<lower=0> sigma_e[M];                     //Error variance -- separate for each marathon
+  vector[R] r_raw;                              //Vector of unscaled runner-level random intercepts
+  vector[VR] vr_raw;                            //Vector of unscaled vaporfly:runner-level random intercepts
+  //vector[VM] vm_raw;                            //Vector of unscaled vaporfly:marathon-level random intercepts
+  vector[Mp] m_raw[M];                          //Array of vectors of unscaled marathon-level random intercepts and slopes
+}
+
+transformed parameters {
+  vector[R] r;                                  //Vector of scaled runner-level random intercepts
+  vector[VR] vr;                                //Vector of scaled vaporfly:runner-level random intercepts
+  //vector[VM] vm;                                //Vector of scaled vaporfly:marathon-level random intercepts
+  vector[Mp] m[M];                              //Array of vectors of scaled marathon-level random intercepts and slopes
+  
+  {
+    matrix[Mp, Mp] Sigma_m;                     //Marathon-level intercept and slope covariance matrix
+    r = sigma_r * r_raw;                        //Create scaled runner-level random intercepts
+    vr = sigma_vr * vr_raw;                     //Create scaled vaporfly:runner-level random intercepts
+    //vm = sigma_vm * vm_raw;                     //Create scaled vaporfly:marathon-level random intercepts
+     
+    Sigma_m = diag_pre_multiply(sigma_m, L_m);  //Create marathon=level intercept and slope covariance matrix using Cholesky decomposition
+    for (a in 1:M) {
+      m[a] = Sigma_m * m_raw[a];                //Create scaled marathon-level random intercepts and slopes
+    }
+  }
+}
+
+model {
+  r_raw ~ std_normal();                         //Standard normal prior on unscaled runner-level random intercepts. Has effect of r ~ Normal(0, r_sigma).
+  vr_raw ~ std_normal();                        //Standard normal prior on unscaled vaporfly:runner-level random intercepts. Has effect of vr ~ Normal(0, vr_sigma).
+  //vm_raw ~ std_normal();                        //Standard normal prior on unscaled vaporfly:marathon-level random intercepts. Has effect of vm ~ Normal(0, vm_sigma).
+  for (b in 1:M) {
+    to_vector(m_raw[b]) ~ std_normal();         //Standard normal prior on unscaled marathon-level random intercepts. Has effect of m ~ MultivariateNormal(c(0,0), Sigma_m).
+    sigma_e[b] ~ cauchy(0,2);                   //Independent Cauchy priors on error variances for each marathon.
+  }
+  L_m ~ lkj_corr_cholesky(1);                   //LKJ prior on Cholesky correlation vector. Imposes uniform prior on correlation between intercept and slope.
+  sigma_r ~ cauchy(0,2);                        //Cauchy prior on runner-level hypervariance parameter.
+  for (c in 1:Mp) {
+    sigma_m[c] ~ cauchy(0,2);                   //Independent Cauchy priors on marathon-level intercept and slope hypervariance parameters.
+  }
+  sigma_vr ~ cauchy(0,2);                       //Cauchy prior on vaporfly:runner-level hypervariance parameter.
+  //sigma_vm ~ cauchy(0,2);                       //Cauchy prior on vaporfly:marathon-level hypervariance parameter.
+  
+  //Likelihood                                  //Normal likelihood function with mixed effects linear predictor and homoscedastic error variance assumption.
+  for (i in 1:N) {
+     logy[i] ~ normal(X[i,]*beta + Z_m[i,]*m[marathon[i]] + r[runner[i]] + vr[vaporfly_runner[i]], sigma_e[marathon[i]]);
+  }
+}
+
+generated quantities {
+  vector[N] residuals;                          //Vector for residuals
+  vector[N] yhat;                               //Vector for estimated linear predictor
+  vector[N] yhat_ppd;                           //Vector for posterior predictive distribution
+  vector[N] log_lik;                            //Vector for log-likelihood values for WAIC calculation
+  
+  for (j in 1:N) {
+    //Samples for the linear predictor yhat
+    yhat[j] = exp(X[j,]*beta + Z_m[j,]*m[marathon[j]] + r[runner[j]] + vr[vaporfly_runner[j]]);
+    //Samples for the posterior predictive distribution, which includes error uncertainty
+    yhat_ppd[j] = normal_rng(exp(X[j,]*beta + Z_m[j,]*m[marathon[j]] + r[runner[j]] + vr[vaporfly_runner[j]]), sigma_e[marathon[j]]);
+    //Samples of log-likelihood for WAIC calculation
+    log_lik[j] = normal_lpdf(logy[j] | (X[j,]*beta + Z_m[j,]*m[marathon[j]] + r[runner[j]] + vr[vaporfly_runner[j]]), sigma_e[marathon[j]]);
+  }
+  
+  residuals = y - yhat;                         //Define residuals as y - hat
+
+}
+
+'
+```
+
+Define the data for stan
+```{r}
+ml.a.5.vm.red.X <- model.matrix(~ vaporfly*gender + gender*age, data=shoes2)
+ml.a.5.vm.red.Z_m <- model.matrix(~ 1 + age, data=shoes2)
+ml.a.5.vm.red.standata <- list(
+  N = nrow(ml.a.5.vm.red.X),
+  P = ncol(ml.a.5.vm.red.X),
+  Mp = ncol(ml.a.5.vm.red.Z_m),
+  M = length(unique(as.integer(factor(shoes2$marathon)))),
+  R = length(unique(as.integer(factor(shoes2$match_name)))),
+  VM = length(unique(as.integer(factor(shoes2$vaporfly_marathon)))),
+  VR = length(unique(as.integer(factor(shoes2$vaporfly_runner)))),
+  marathon = as.integer(factor(shoes2$marathon)),
+  runner = as.integer(factor(shoes2$match_name)),
+  vaporfly_marathon = as.integer(factor(shoes2$vaporfly_marathon)),
+  vaporfly_runner = as.integer(factor(shoes2$vaporfly_runner)),
+  X = ml.a.5.vm.red.X,
+  Z_m = ml.a.5.vm.red.Z_m,
+  y = shoes2$time_minutes
+)
+```
+
+Set initial values
+```{r}
+Mp = ncol(ml.a.5.vm.red.Z_m)
+M = length(unique(as.integer(factor(shoes2$marathon))))
+R = length(unique(as.integer(factor(shoes2$match_name))))
+VM = length(unique(as.integer(factor(shoes2$vaporfly_marathon))))
+VR = length(unique(as.integer(factor(shoes2$vaporfly_runner))))
+marathon = as.integer(factor(shoes2$marathon))
+runner = as.integer(factor(shoes2$match_name))
+vaporfly_marathon = as.integer(factor(shoes2$vaporfly_marathon))
+vaporfly_runner = as.integer(factor(shoes2$vaporfly_runner))
+
+initf2.norm <- function(chain_id = 1) {
+  # cat("chain_id =", chain_id, "\n")
+  list(beta = array(rnorm(ncol(ml.a.5.vm.red.X), sd=0.1), dim = c(ncol(ml.a.5.vm.red.X))),
+       sigma_r = 1,
+       sigma_vr = 1,
+       sigma_vm = 1,
+       sigma_m = array(rlnorm(Mp, sdlog = 0.1), dim = Mp),
+       sigma_e = array(rlnorm(M, sdlog = 0.1), dim=M),
+       r_raw = array(rnorm(R, sd=0.1), dim=R),
+       vr_raw = array(rnorm(VR, sd=0.1), dim=VR),
+       vm_raw = array(rnorm(VM, sd=0.1), dim=VM),
+       m_raw = array(rnorm(M*2, sd=0.1), dim = c(M,2))
+       )
+}
+
+# generate a list of lists to specify initial values
+n_chains <- 3
+init_ll.norm <- lapply(1:n_chains, function(id) initf2.norm(chain_id = id))
+```
+
+Run the model
+```{r}
+ml.a.5.vm.red.stanfit <- stan(
+  model_code = ml.a.5.vm.red.stancode,
+  data=ml.a.5.vm.red.standata, 
+  control = list(max_treedepth = 15, adapt_delta=0.9),
+  init = init_ll.norm,
+  chains=3,
+  warmup=3000,
+  iter=11000,
+  cores=3
+)
+```
+
+Run a loop of the model
+```{r}
+B <- 5
+ml.a.5.vm.red.stanfit.list <- list(NULL)
+for (i in 1:B) {
+  ml.a.5.vm.red.stanfit.list[[i]] <- stan(
+  model_code = ml.a.5.vm.red.stancode,
+  data=ml.a.5.vm.red.standata, 
+  control = list(max_treedepth = 15, adapt_delta=0.9),
+  init = init_ll.norm,
+  chains=2,
+  warmup=2000,
+  iter=6000,
+  cores=2
+)
+}
+
+ml.a.5.vm.red.log.lik.list <- lapply(ml.a.5.vm.red.stanfit.list, FUN = extract_log_lik)
+ml.a.5.vm.red.fbar.list <- lapply(ml.a.5.vm.red.log.lik.list, FUN = function(x) colMeans(exp(x)))
+ml.a.5.vm.red.Pw.list <- lapply(ml.a.5.vm.red.log.lik.list, FUN = function(x) sum(apply(x, 2, var)))
+ml.a.5.vm.red.WAIC.1.list <- lapply(ml.a.5.vm.red.fbar.list, FUN = function(x) -2*sum(log(x)))
+ml.a.5.vm.red.WAIC.2.list <- lapply(ml.a.5.vm.red.Pw.list, FUN = function(x) 2*x)
+ml.a.5.vm.red.WAIC <- 1:B
+for (i in 1:B) {
+  ml.a.5.vm.red.WAIC[i] <- ml.a.5.vm.red.WAIC.1.list[[i]] + ml.a.5.vm.red.WAIC.2.list[[i]]
+}
+(ml.a.5.vm.red.WAIC.quant <- quantile(probs = c(0.025, 0.975), c(ml.a.5.vm.red.WAIC, -4477)))
+write.csv(ml.a.5.vm.red.WAIC.quant, file="/Users/tschappe/Documents/NC\ State\ Classes/ST540/Take\ Home\ Exam/ml.a.5.vm.red.WAIC.quant.csv")
+```
+
+WAIC
+```{r}
+ml.a.5.vm.red.stanfit.loglik <- extract_log_lik(ml.a.5.vm.red.stanfit)
+fbar <- colMeans(exp(ml.a.5.vm.red.stanfit.loglik))
+Pw <- sum(apply(ml.a.5.vm.red.stanfit.loglik, 2, var))
+WAIC <- -2*sum(log(fbar)) + 2*Pw
+WAIC #-4476.9
+```
